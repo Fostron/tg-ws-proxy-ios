@@ -49,12 +49,21 @@ struct ConnectionTab: View {
                     proxyUrlCard
                         .padding(.horizontal)
 
-                    if proxyManager.isRunning {
-                        Text(proxyManager.stats.description)
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                            .padding(.top, 4)
-                    }
+                    // Fixed-height slot: the line used to be inserted into the
+                    // stack when the proxy started, which grew the content and
+                    // made the surrounding Spacers shove everything upward.
+                    // Reserving the space keeps the layout still and lets the
+                    // text simply fade in.
+                    Text(proxyManager.stats.description)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .padding(.top, 4)
+                        .frame(height: 20)
+                        .opacity(proxyManager.isRunning ? 1 : 0)
+                        .animation(.easeInOut(duration: 0.35), value: proxyManager.isRunning)
+                        .animation(.easeInOut(duration: 0.25), value: proxyManager.stats.description)
 
                     Spacer()
                 }
@@ -204,7 +213,7 @@ struct ConnectionTab: View {
             isStarting = false
         } else {
             guard settings.isCfWorkerURLValid, settings.isCustomCfDomainValid,
-                  settings.isFakeTlsDomainValid, settings.isDohCustomURLValid else {
+                  settings.isFakeTlsDomainValid, settings.isDohCustomURLValid, settings.isBindIpValid else {
                 isStarting = false
                 return
             }
@@ -213,6 +222,7 @@ struct ConnectionTab: View {
             isStarting = true
             let dcIps = settings.buildDcIps()
             let port = Int(settings.port) ?? 1443
+            let bindIp = settings.effectiveBindIp()
             // Advanced networking (Worker/FakeTLS/DoH/custom domain) only
             // takes effect when Experimental Features is unlocked, even if
             // the individual toggles were left on from before.
@@ -221,6 +231,10 @@ struct ConnectionTab: View {
             let workerURL = settings.effectiveCfWorkerURL()
             let tlsEnabled = settings.effectiveFakeTlsEnabled
             let tlsDomain = settings.effectiveFakeTlsDomain()
+            let fragOn = settings.effectiveFragmentEnabled
+            let fragSize = settings.fragmentFirstSize
+            let fragDelay = settings.fragmentDelayMs
+            let tlsFp = settings.effectiveTlsFingerprint
             let dohCf = settings.effectiveDohUseCloudflare
             let dohGoogle = settings.effectiveDohUseGoogle
             let dohQuad9 = settings.effectiveDohUseQuad9
@@ -229,6 +243,7 @@ struct ConnectionTab: View {
 
             DispatchQueue.global(qos: .userInitiated).async {
                 let started = proxyManager.start(
+                    bindIp: bindIp,
                     port: port,
                     dcIps: dcIps,
                     poolSize: settings.poolSize,
@@ -239,6 +254,10 @@ struct ConnectionTab: View {
                     cfWorkerURL: workerURL,
                     fakeTlsEnabled: tlsEnabled,
                     fakeTlsDomain: tlsDomain,
+                    fragmentEnabled: fragOn,
+                    fragmentFirstSize: fragSize,
+                    fragmentDelayMs: fragDelay,
+                    tlsFingerprint: tlsFp,
                     dohUseCloudflare: dohCf,
                     dohUseGoogle: dohGoogle,
                     dohUseQuad9: dohQuad9,

@@ -29,10 +29,11 @@ struct TgWsProxyApp: App {
     
     private func startProxyAndRedirect() {
         guard settings.isCfWorkerURLValid, settings.isCustomCfDomainValid,
-              settings.isFakeTlsDomainValid, settings.isDohCustomURLValid else { return }
+              settings.isFakeTlsDomainValid, settings.isDohCustomURLValid, settings.isBindIpValid else { return }
 
         let dcIps = settings.buildDcIps()
         let port = Int(settings.port) ?? 1443
+        let bindIp = settings.effectiveBindIp()
         // Same gating as the manual start path in ConnectionTab: advanced
         // networking only applies when Experimental Features is unlocked.
         let cfDomain = settings.effectiveCustomCfDomain
@@ -40,6 +41,10 @@ struct TgWsProxyApp: App {
         let workerURL = settings.effectiveCfWorkerURL()
         let tlsEnabled = settings.effectiveFakeTlsEnabled
         let tlsDomain = settings.effectiveFakeTlsDomain()
+        let fragOn = settings.effectiveFragmentEnabled
+        let fragSize = settings.fragmentFirstSize
+        let fragDelay = settings.fragmentDelayMs
+        let tlsFp = settings.effectiveTlsFingerprint
         let dohCf = settings.effectiveDohUseCloudflare
         let dohGoogle = settings.effectiveDohUseGoogle
         let dohQuad9 = settings.effectiveDohUseQuad9
@@ -48,6 +53,7 @@ struct TgWsProxyApp: App {
 
         DispatchQueue.global(qos: .userInitiated).async {
             let started = proxyManager.start(
+                bindIp: bindIp,
                 port: port,
                 dcIps: dcIps,
                 poolSize: settings.poolSize,
@@ -58,6 +64,10 @@ struct TgWsProxyApp: App {
                 cfWorkerURL: workerURL,
                 fakeTlsEnabled: tlsEnabled,
                 fakeTlsDomain: tlsDomain,
+                fragmentEnabled: fragOn,
+                fragmentFirstSize: fragSize,
+                fragmentDelayMs: fragDelay,
+                tlsFingerprint: tlsFp,
                 dohUseCloudflare: dohCf,
                 dohUseGoogle: dohGoogle,
                 dohUseQuad9: dohQuad9,

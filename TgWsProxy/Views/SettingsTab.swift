@@ -4,33 +4,58 @@ struct SettingsTab: View {
     @EnvironmentObject var proxyManager: ProxyManager
     @EnvironmentObject var settings: SettingsStore
     @State private var showIpSetup = false
+    /// Numeric keypads have no return key, so without an explicit Done button
+    /// the keyboard can't be dismissed by tapping anywhere obvious.
+    @FocusState private var focusedField: NumericField?
+
+    private enum NumericField: Hashable { case ip, port }
 
     private var accent: Color { AppPalette(from: settings.themePalette).accent }
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 16) {
-                    connectionCard
-                    poolCard
-                    secretCard
-                    cdnCard
-                    experimentalCard
+                GlassGroup(spacing: 16) {
+                    VStack(spacing: 16) {
+                        connectionCard
+                        poolCard
+                        secretCard
+                        cdnCard
+                        experimentalCard
 
-                    if settings.experimentalFeaturesEnabled {
-                        workerCard
-                        fakeTlsCard
-                        dohCard
+                        if settings.experimentalFeaturesEnabled {
+                            Group {
+                                workerCard
+                                fakeTlsCard
+                                dohCard
+                            }
+                            .transition(
+                                .asymmetric(
+                                    insertion: .move(edge: .top)
+                                        .combined(with: .opacity)
+                                        .combined(with: .scale(scale: 0.96, anchor: .top)),
+                                    removal: .opacity
+                                        .combined(with: .scale(scale: 0.96, anchor: .top))
+                                )
+                            )
+                        }
+
+                        autoStartCard
                     }
-
-                    autoStartCard
                 }
                 .padding(.horizontal)
                 .padding(.top, 8)
                 .padding(.bottom, 24)
-                .animation(.easeInOut(duration: 0.2), value: settings.experimentalFeaturesEnabled)
+                .animation(.spring(response: 0.42, dampingFraction: 0.82),
+                           value: settings.experimentalFeaturesEnabled)
             }
             .navigationTitle(settings.t("settings.title"))
+            .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Готово") { focusedField = nil }
+                }
+            }
             .sheet(isPresented: $showIpSetup) {
                 IpSetupSheet()
             }
@@ -44,6 +69,31 @@ struct SettingsTab: View {
             header("network", settings.t("settings.connection"))
 
             HStack {
+                Text("IP")
+                Spacer()
+                TextField("127.0.0.1", text: $settings.bindIp)
+                    .keyboardType(.decimalPad)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 130)
+                    .disabled(proxyManager.isRunning)
+                    .focused($focusedField, equals: .ip)
+                    // decimalPad has no letters, but paste can still bring
+                    // them in — strip anything that isn't a digit or a dot.
+                    .onChange(of: settings.bindIp) { newValue in
+                        let cleaned = newValue.filter { $0.isNumber || $0 == "." }
+                        if cleaned != newValue { settings.bindIp = cleaned }
+                    }
+            }
+
+            if !settings.isBindIpValid {
+                Text("Неверный IPv4-адрес")
+                    .font(.caption)
+                    .foregroundColor(.red)
+            }
+
+            HStack {
                 Text(settings.t("settings.port"))
                 Spacer()
                 TextField("1443", text: $settings.port)
@@ -51,6 +101,11 @@ struct SettingsTab: View {
                     .multilineTextAlignment(.trailing)
                     .frame(width: 80)
                     .disabled(proxyManager.isRunning)
+                    .focused($focusedField, equals: .port)
+                    .onChange(of: settings.port) { newValue in
+                        let cleaned = String(newValue.filter { $0.isNumber }.prefix(5))
+                        if cleaned != newValue { settings.port = cleaned }
+                    }
             }
 
             Button(action: { showIpSetup = true }) {
@@ -122,7 +177,7 @@ struct SettingsTab: View {
                     .disabled(proxyManager.isRunning)
 
                 if settings.customCfDomainEnabled {
-                    TextField("cdn.example.com", text: $settings.customCfDomain)
+                    TextField("mydomain.com (можно несколько через запятую)", text: $settings.customCfDomain)
                         .keyboardType(.URL)
                         .textContentType(.URL)
                         .textInputAutocapitalization(.never)
@@ -139,6 +194,8 @@ struct SettingsTab: View {
         }
         .padding(18)
         .glassCard()
+        .animation(.spring(response: 0.38, dampingFraction: 0.85), value: settings.cfproxyEnabled)
+        .animation(.spring(response: 0.38, dampingFraction: 0.85), value: settings.customCfDomainEnabled)
     }
 
     private var experimentalCard: some View {
@@ -166,7 +223,7 @@ struct SettingsTab: View {
             .disabled(proxyManager.isRunning)
 
             if settings.cfWorkerEnabled {
-                TextField("https://your-worker.example.workers.dev", text: $settings.cfWorkerURL)
+                TextField("name-1234.user.workers.dev (можно несколько через запятую)", text: $settings.cfWorkerURL)
                     .keyboardType(.URL)
                     .textContentType(.URL)
                     .textInputAutocapitalization(.never)
@@ -182,6 +239,7 @@ struct SettingsTab: View {
         }
         .padding(18)
         .glassCard()
+        .animation(.spring(response: 0.38, dampingFraction: 0.85), value: settings.cfWorkerEnabled)
     }
 
     private var fakeTlsCard: some View {
@@ -208,6 +266,57 @@ struct SettingsTab: View {
         }
         .padding(18)
         .glassCard()
+        .animation(.spring(response: 0.38, dampingFraction: 0.85), value: settings.fakeTlsEnabled)
+    }
+
+    private var tlsFingerprintCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            header("signature", "TLS-отпечаток")
+
+            Picker("", selection: $settings.tlsFingerprint) {
+                Text("Стандартный").tag(0)
+                Text("Firefox").tag(1)
+                Text("Chrome").tag(2)
+                Text("Safari").tag(3)
+            }
+            .pickerStyle(.segmented)
+            .disabled(proxyManager.isRunning)
+
+            Text(settings.tlsFingerprint == 0
+                 ? "Стандартный стек Go — узнаваем по JA3/JA4, но максимально совместим"
+                 : "Маскирует рукопожатие под браузер. Если соединение обрывается сразу (EOF), вернитесь на стандартный")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+        .padding(18)
+        .glassCard()
+        .animation(.spring(response: 0.38, dampingFraction: 0.85), value: settings.tlsFingerprint)
+    }
+
+    private var fragmentCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Toggle(isOn: $settings.fragmentEnabled) {
+                header("scissors", "Фрагментация ClientHello")
+            }
+            .disabled(proxyManager.isRunning)
+
+            if settings.fragmentEnabled {
+                Stepper("Первый сегмент: \(settings.fragmentFirstSize) Б",
+                        value: $settings.fragmentFirstSize, in: 1...16)
+                    .disabled(proxyManager.isRunning)
+
+                Stepper("Пауза: \(settings.fragmentDelayMs) мс",
+                        value: $settings.fragmentDelayMs, in: 0...100, step: 5)
+                    .disabled(proxyManager.isRunning)
+
+                Text("Разбивает TLS-рукопожатие на части, чтобы имя домена не попало целиком в первый пакет — аналог split2 из zapret")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(18)
+        .glassCard()
+        .animation(.spring(response: 0.38, dampingFraction: 0.85), value: settings.fragmentEnabled)
     }
 
     private var dohCard: some View {

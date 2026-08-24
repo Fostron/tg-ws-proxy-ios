@@ -13,7 +13,8 @@ struct LogsTab: View {
         return logManager.logs.filter { entry in
             entry.isEssential ||
             (settings.logShowInfo && entry.level == .info) ||
-            (settings.logShowError && (entry.level == .error || entry.level == .warn))
+            (settings.logShowError && (entry.level == .error || entry.level == .warn)) ||
+            (settings.logShowDebug && entry.level == .debug)
         }
     }
 
@@ -35,13 +36,17 @@ struct LogsTab: View {
             .padding(.horizontal)
             .padding(.top, 8)
 
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 FilterChip(label: "INFO", selected: settings.logShowInfo && !settings.logShowNull, accent: accent) {
                     settings.logShowInfo.toggle()
                     settings.logShowNull = false
                 }
                 FilterChip(label: "ERROR", selected: settings.logShowError && !settings.logShowNull, accent: accent) {
                     settings.logShowError.toggle()
+                    settings.logShowNull = false
+                }
+                FilterChip(label: "DEBUG", selected: settings.logShowDebug && !settings.logShowNull, accent: AppColors.terminalBlue) {
+                    settings.logShowDebug.toggle()
                     settings.logShowNull = false
                 }
                 FilterChip(label: "NULL", selected: settings.logShowNull, accent: .gray) {

@@ -3,6 +3,9 @@ import Foundation
 class SettingsStore: ObservableObject {
     private let defaults = UserDefaults.standard
 
+    /// Loopback keeps the proxy reachable only from this device — the safe
+    /// default. 0.0.0.0 exposes it to the whole local network.
+    static let defaultBindIp = "127.0.0.1"
     static let defaultPort = "1443"
     static let defaultPoolSize = 4
     static let defaultDc2Ip = "149.154.167.220"
@@ -10,6 +13,7 @@ class SettingsStore: ObservableObject {
 
     private enum Keys {
         static let port = "port"
+        static let bindIp = "bind_ip"
         static let poolSize = "pool_size"
         static let secretKey = "secret_key"
         static let cfproxyEnabled = "cfproxy_enabled"
@@ -19,6 +23,10 @@ class SettingsStore: ObservableObject {
         static let cfWorkerURL = "cf_worker_url"
         static let fakeTlsEnabled = "fake_tls_enabled"
         static let fakeTlsDomain = "fake_tls_domain"
+        static let tlsFingerprint = "tls_fingerprint"
+        static let fragmentEnabled = "fragment_enabled"
+        static let fragmentFirstSize = "fragment_first_size"
+        static let fragmentDelayMs = "fragment_delay_ms"
         static let dohUseCloudflare = "doh_use_cloudflare"
         static let dohUseGoogle = "doh_use_google"
         static let dohUseQuad9 = "doh_use_quad9"
@@ -46,8 +54,12 @@ class SettingsStore: ObservableObject {
         static let logShowInfo = "log_show_info"
         static let logShowError = "log_show_error"
         static let logShowNull = "log_show_null"
+        static let logShowDebug = "log_show_debug"
     }
 
+    @Published var bindIp: String {
+        didSet { defaults.set(bindIp, forKey: Keys.bindIp) }
+    }
     @Published var port: String {
         didSet { defaults.set(port, forKey: Keys.port) }
     }
@@ -77,6 +89,19 @@ class SettingsStore: ObservableObject {
     }
     @Published var fakeTlsDomain: String {
         didSet { defaults.set(fakeTlsDomain, forKey: Keys.fakeTlsDomain) }
+    }
+    /// 0 = Go stdlib, 1 = Firefox, 2 = Chrome, 3 = Safari, 4 = randomized.
+    @Published var tlsFingerprint: Int {
+        didSet { defaults.set(tlsFingerprint, forKey: Keys.tlsFingerprint) }
+    }
+    @Published var fragmentEnabled: Bool {
+        didSet { defaults.set(fragmentEnabled, forKey: Keys.fragmentEnabled) }
+    }
+    @Published var fragmentFirstSize: Int {
+        didSet { defaults.set(fragmentFirstSize, forKey: Keys.fragmentFirstSize) }
+    }
+    @Published var fragmentDelayMs: Int {
+        didSet { defaults.set(fragmentDelayMs, forKey: Keys.fragmentDelayMs) }
     }
     @Published var dohUseCloudflare: Bool {
         didSet { defaults.set(dohUseCloudflare, forKey: Keys.dohUseCloudflare) }
@@ -141,11 +166,15 @@ class SettingsStore: ObservableObject {
     @Published var logShowError: Bool {
         didSet { defaults.set(logShowError, forKey: Keys.logShowError) }
     }
+    @Published var logShowDebug: Bool {
+        didSet { defaults.set(logShowDebug, forKey: Keys.logShowDebug) }
+    }
     @Published var logShowNull: Bool {
         didSet { defaults.set(logShowNull, forKey: Keys.logShowNull) }
     }
 
     init() {
+        bindIp = defaults.string(forKey: Keys.bindIp) ?? SettingsStore.defaultBindIp
         port = defaults.string(forKey: Keys.port) ?? SettingsStore.defaultPort
         poolSize = defaults.object(forKey: Keys.poolSize) as? Int ?? SettingsStore.defaultPoolSize
         secretKey = defaults.string(forKey: Keys.secretKey) ?? ""
@@ -156,6 +185,10 @@ class SettingsStore: ObservableObject {
         cfWorkerURL = defaults.string(forKey: Keys.cfWorkerURL) ?? ""
         fakeTlsEnabled = defaults.object(forKey: Keys.fakeTlsEnabled) as? Bool ?? false
         fakeTlsDomain = defaults.string(forKey: Keys.fakeTlsDomain) ?? ""
+        tlsFingerprint = defaults.object(forKey: Keys.tlsFingerprint) as? Int ?? 0
+        fragmentEnabled = defaults.object(forKey: Keys.fragmentEnabled) as? Bool ?? false
+        fragmentFirstSize = defaults.object(forKey: Keys.fragmentFirstSize) as? Int ?? 2
+        fragmentDelayMs = defaults.object(forKey: Keys.fragmentDelayMs) as? Int ?? 10
         dohUseCloudflare = defaults.object(forKey: Keys.dohUseCloudflare) as? Bool ?? true
         dohUseGoogle = defaults.object(forKey: Keys.dohUseGoogle) as? Bool ?? true
         dohUseQuad9 = defaults.object(forKey: Keys.dohUseQuad9) as? Bool ?? true
@@ -183,6 +216,7 @@ class SettingsStore: ObservableObject {
         logShowInfo = defaults.object(forKey: Keys.logShowInfo) as? Bool ?? true
         logShowError = defaults.object(forKey: Keys.logShowError) as? Bool ?? true
         logShowNull = defaults.object(forKey: Keys.logShowNull) as? Bool ?? false
+        logShowDebug = defaults.object(forKey: Keys.logShowDebug) as? Bool ?? false
 
         if secretKey.isEmpty {
             secretKey = SettingsStore.generateRandomSecret()
@@ -230,30 +264,47 @@ class SettingsStore: ObservableObject {
 
     /// True when the Worker URL is well-formed enough to dial (https scheme + host).
     /// Returns true when the feature is off/locked, since an unused field isn't invalid.
+    /// Several worker domains may be listed comma-separated; the core tries
+    /// them in order so one dead worker doesn't take the tier down. A bare
+    /// hostname ("name-1234.user.workers.dev") is accepted too, since that's
+    /// exactly what the Cloudflare dashboard hands you.
     var isCfWorkerURLValid: Bool {
         guard experimentalFeaturesEnabled, cfWorkerEnabled else { return true }
-        let trimmed = cfWorkerURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: trimmed),
-              let scheme = url.scheme?.lowercased(),
-              scheme == "https",
-              let host = url.host, !host.isEmpty else {
-            return false
+        let entries = cfWorkerURL
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !entries.isEmpty else { return false }
+
+        return entries.allSatisfy { entry in
+            let normalized = entry.contains("://") ? entry : "https://" + entry
+            guard let url = URL(string: normalized),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "https",
+                  let host = url.host, !host.isEmpty, host.contains(".") else {
+                return false
+            }
+            return true
         }
-        return true
     }
 
     /// True when the custom CF domain field is usable: a bare hostname, no
     /// scheme/path (this gets templated into kws{dc}.<domain>/apiws internally).
     var isCustomCfDomainValid: Bool {
         guard experimentalFeaturesEnabled, customCfDomainEnabled else { return true }
-        let trimmed = customCfDomain.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              !trimmed.contains("://"),
-              !trimmed.contains("/"),
-              trimmed.contains(".") else {
-            return false
+        // Comma, semicolon or whitespace separated, matching upstream's
+        // coerce_domain_list(). Any TLD is accepted — the domain just needs
+        // kws1..kws5/kws203 A-records pointing at the Telegram DC IPs.
+        let entries = customCfDomain
+            .split(whereSeparator: { $0 == "," || $0 == ";" || $0.isWhitespace })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+        guard !entries.isEmpty else { return false }
+
+        return entries.allSatisfy { d in
+            !d.contains("://") && !d.contains("/") && d.contains(".")
+                && !d.hasPrefix(".") && !d.hasSuffix(".")
         }
-        return true
     }
 
     /// True when the FakeTLS decoy domain is a bare hostname (no scheme/path —
@@ -308,20 +359,78 @@ class SettingsStore: ObservableObject {
         experimentalFeaturesEnabled && fakeTlsEnabled
     }
 
-    var effectiveDohUseCloudflare: Bool { experimentalFeaturesEnabled && dohUseCloudflare }
-    var effectiveDohUseGoogle: Bool { experimentalFeaturesEnabled && dohUseGoogle }
-    var effectiveDohUseQuad9: Bool { experimentalFeaturesEnabled && dohUseQuad9 }
-    var effectiveDohUseAdguard: Bool { experimentalFeaturesEnabled && dohUseAdguard }
+    /// Built-in DoH resolvers are NOT gated by the experimental toggle.
+    /// Gating them meant that turning experimental features off left
+    /// dohEndpoints empty in the core, so resolveDoH() skipped its DoH phase
+    /// entirely and fell straight through to plaintext UDP:53 — a silent
+    /// privacy downgrade for ordinary users. Encrypted DNS is baseline
+    /// behaviour; only the custom endpoint below is experimental.
+    /// Fragmentation is an experimental transport tweak like Worker/FakeTLS.
+    var effectiveFragmentEnabled: Bool { experimentalFeaturesEnabled && fragmentEnabled }
+
+    var effectiveTlsFingerprint: Int { experimentalFeaturesEnabled ? tlsFingerprint : 0 }
+
+    var effectiveDohUseCloudflare: Bool { dohUseCloudflare }
+    var effectiveDohUseGoogle: Bool { dohUseGoogle }
+    var effectiveDohUseQuad9: Bool { dohUseQuad9 }
+    var effectiveDohUseAdguard: Bool { dohUseAdguard }
 
     var effectiveDohCustomURL: String {
         experimentalFeaturesEnabled ? dohCustomURL.trimmingCharacters(in: .whitespacesAndNewlines) : ""
     }
 
-    func proxyUrl() -> String {
-        let p = Int(port) ?? 1443
+    /// Builds the secret exactly as the Go core's GetSecretWithPrefix() does:
+    /// FakeTLS mode requires an "ee" prefix plus the hex-encoded decoy domain,
+    /// plain MTProto uses "dd". Hardcoding "dd" here would silently disable
+    /// FakeTLS — the core would expect an ee handshake that Telegram never sends.
+    private func secretWithPrefix() -> String {
         let secret = secretKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let safeSecret = secret.isEmpty ? "00000000000000000000000000000000" : secret
-        return "https://t.me/proxy?server=127.0.0.1&port=\(p)&secret=dd\(safeSecret)"
+
+        let domain = effectiveFakeTlsDomain()
+        if fakeTlsEnabled, !domain.isEmpty, isFakeTlsDomainValid {
+            let domHex = domain.utf8.map { String(format: "%02x", $0) }.joined()
+            return "ee" + safeSecret + domHex
+        }
+        return "dd" + safeSecret
+    }
+
+    /// Accepts a bare IPv4 literal only. Hostnames are rejected because the
+    /// core hands this straight to the listener, and a name that resolves
+    /// elsewhere would silently bind nothing reachable.
+    var isBindIpValid: Bool {
+        let t = bindIp.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty { return true }
+        let parts = t.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        return parts.allSatisfy { p in
+            guard !p.isEmpty, p.count <= 3, p.allSatisfy({ $0.isNumber }),
+                  let v = Int(p), v >= 0, v <= 255 else { return false }
+            return true
+        }
+    }
+
+    /// True when the proxy will be reachable from other devices on the LAN,
+    /// i.e. anything other than loopback. Surfaced in the UI as a warning.
+    var bindIpIsExposed: Bool {
+        let t = effectiveBindIp()
+        return t != "127.0.0.1" && !t.hasPrefix("127.")
+    }
+
+    func effectiveBindIp() -> String {
+        let t = bindIp.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (t.isEmpty || !isBindIpValid) ? SettingsStore.defaultBindIp : t
+    }
+
+    /// Host to put in the proxy link — mirrors the configured bind IP exactly,
+    /// so what's typed in Settings is what shows up in the link and clipboard.
+    private func linkHost() -> String {
+        effectiveBindIp()
+    }
+
+    func proxyUrl() -> String {
+        let p = Int(port) ?? 1443
+        return "https://t.me/proxy?server=\(linkHost())&port=\(p)&secret=\(secretWithPrefix())"
     }
 
     /// Native Telegram app deep link — opens Telegram directly instead of
@@ -329,8 +438,6 @@ class SettingsStore: ObservableObject {
     /// preview instead of the app depending on how iOS resolves the link.
     func tgProxyUrl() -> String {
         let p = Int(port) ?? 1443
-        let secret = secretKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        let safeSecret = secret.isEmpty ? "00000000000000000000000000000000" : secret
-        return "tg://proxy?server=127.0.0.1&port=\(p)&secret=dd\(safeSecret)"
+        return "tg://proxy?server=\(linkHost())&port=\(p)&secret=\(secretWithPrefix())"
     }
 }

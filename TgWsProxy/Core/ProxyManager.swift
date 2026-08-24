@@ -46,9 +46,11 @@ class ProxyManager: ObservableObject {
 
     private init() {}
 
-    func start(port: Int, dcIps: String, poolSize: Int, cfEnabled: Bool, cfPriority: Bool, cfDomain: String,
+    func start(bindIp: String = "127.0.0.1", port: Int, dcIps: String, poolSize: Int, cfEnabled: Bool, cfPriority: Bool, cfDomain: String,
                cfWorkerEnabled: Bool = false, cfWorkerURL: String = "",
                fakeTlsEnabled: Bool = false, fakeTlsDomain: String = "",
+               fragmentEnabled: Bool = false, fragmentFirstSize: Int = 2, fragmentDelayMs: Int = 10,
+               tlsFingerprint: Int = 0,
                dohUseCloudflare: Bool = true, dohUseGoogle: Bool = true,
                dohUseQuad9: Bool = true, dohUseAdguard: Bool = true, dohCustomURL: String = "",
                secretKey: String) -> Bool {
@@ -59,6 +61,8 @@ class ProxyManager: ObservableObject {
         SetCfProxyConfig(cfEnabled ? 1 : 0, cfPriority ? 1 : 0, cfDomain)
         SetCfWorkerConfig(cfWorkerEnabled ? 1 : 0, cfWorkerURL)
         SetFakeTls(fakeTlsEnabled ? 1 : 0, fakeTlsDomain)
+        SetFragmentConfig(fragmentEnabled ? 1 : 0, Int32(fragmentFirstSize), Int32(fragmentDelayMs))
+        SetTlsFingerprint(Int32(tlsFingerprint))
         SetDohConfig(
             dohUseCloudflare ? 1 : 0,
             dohUseGoogle ? 1 : 0,
@@ -67,8 +71,20 @@ class ProxyManager: ObservableObject {
             dohCustomURL
         )
 
-        let host = "127.0.0.1"
-        let result = StartProxy(host, Int32(port), dcIps, secretKey, 1)
+        LogManager.shared.addLog("Запуск на \(bindIp):\(port)...", level: .info)
+        let result = StartProxy(bindIp, Int32(port), dcIps, secretKey, 1)
+        if result != 0 {
+            // Almost always a bind failure: the address must actually exist on
+            // one of this device's interfaces. A LAN IP that belonged to the
+            // phone on a different Wi-Fi network will fail here.
+            LogManager.shared.addLog(
+                "Не удалось занять \(bindIp):\(port) — проверьте, что этот IP принадлежит устройству в текущей сети, и что порт свободен",
+                level: .error
+            )
+            for line in self.getLogs() {
+                LogManager.shared.addLog(line, level: Self.logLevel(for: line))
+            }
+        }
 
         if result == 0 {
             DispatchQueue.main.async {
@@ -84,8 +100,14 @@ class ProxyManager: ObservableObject {
     func stop() {
         guard isRunning else { return }
         statsQueue.async {
+            LogManager.shared.addLog("Отключение прокси...", level: .info)
             StopProxy()
-            _ = self.getLogs()
+            // Drain what the core logged while shutting down instead of
+            // throwing it away — this is where "Остановка прокси..." lands.
+            for line in self.getLogs() {
+                LogManager.shared.addLog(line, level: Self.logLevel(for: line))
+            }
+            LogManager.shared.addLog("Прокси остановлен", level: .info)
             DispatchQueue.main.async {
                 self.isRunning = false
                 self.stats = ProxyStats()

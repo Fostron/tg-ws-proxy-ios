@@ -11,13 +11,15 @@ struct InfoTab: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 16) {
-                    heroCard
+                GlassGroup(spacing: 16) {
+                    VStack(spacing: 16) {
+                        heroCard
 
-                    actionSection
-                    projectSection
+                        actionSection
+                        projectSection
 
-                    Spacer(minLength: 20)
+                        Spacer(minLength: 20)
+                    }
                 }
                 .padding()
             }

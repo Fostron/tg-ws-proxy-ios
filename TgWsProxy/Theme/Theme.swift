@@ -116,3 +116,25 @@ extension View {
         modifier(GlassCardModifier(cornerRadius: cornerRadius, tint: tint))
     }
 }
+
+/// Groups multiple glass surfaces into a single rendering pass.
+///
+/// Without this, every `.glassEffect()` sampled and refracted the backdrop on
+/// its own; while scrolling, those independent layers update out of sync and
+/// the cards visibly flicker — worst on screens with many stacked cards and
+/// buttons. `GlassEffectContainer` merges them so they're computed together.
+/// No-op below iOS 26, where the Material fallback doesn't have this issue.
+struct GlassGroup<Content: View>: View {
+    var spacing: CGFloat = 16
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        if #available(iOS 26.0, *) {
+            GlassEffectContainer(spacing: spacing) {
+                content()
+            }
+        } else {
+            content()
+        }
+    }
+}

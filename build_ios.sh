@@ -20,6 +20,12 @@ if ! command -v xcodebuild &> /dev/null; then
     exit 1
 fi
 
+# uTLS and its dependencies are fetched here rather than committing go.sum:
+# the module graph pulls golang.org/x/* which resolves differently depending on
+# the toolchain, and `go mod tidy` on the build machine keeps it consistent.
+echo "--- Step 0: Resolving Go modules ---"
+go mod tidy
+
 echo "--- Step 1: Building Go Library ---"
 rm -rf $BUILD_DIR/$APP_NAME.xcframework
 mkdir -p $BUILD_DIR/ios $BUILD_DIR/sim

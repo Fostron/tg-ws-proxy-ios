@@ -15,6 +15,8 @@ void SetCfProxyConfig(int enabled, int priority, const char* userDomain);
 void SetCfWorkerConfig(int enabled, const char* workerURL);
 void SetSecret(const char* secret);
 void SetFakeTls(int enabled, const char* domain);
+void SetFragmentConfig(int enabled, int firstSize, int delayMs);
+void SetTlsFingerprint(int fp);
 void SetDohConfig(int useCloudflare, int useGoogle, int useQuad9, int useAdguard, const char* customURL);
 char* GetSecretWithPrefix(void);
 char* GetStats(void);
