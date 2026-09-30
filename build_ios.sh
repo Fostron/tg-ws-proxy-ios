@@ -27,8 +27,8 @@ echo "--- Step 0: Resolving Go modules ---"
 go mod tidy
 
 echo "--- Step 1: Building Go Library ---"
-rm -rf $BUILD_DIR/$APP_NAME.xcframework
-mkdir -p $BUILD_DIR/ios $BUILD_DIR/sim
+rm -rf $BUILD_DIR/ios $BUILD_DIR/ipa $BUILD_DIR/$APP_NAME.ipa $BUILD_DIR/$APP_NAME.xcarchive
+mkdir -p $BUILD_DIR/ios
 
 # Каждая сборка получает уникальный CFBundleVersion (номер запуска CI, либо unix-время
 # локально), чтобы iOS и sideload-тулзы точно видели новую версию и не подсовывали
@@ -37,32 +37,36 @@ BUILD_NUMBER="${GITHUB_RUN_NUMBER:-$(date +%s)}"
 echo "Build number: $BUILD_NUMBER"
 plutil -replace CFBundleVersion -string "$BUILD_NUMBER" TgWsProxy/Info.plist
 
-# Сохраняем пути к SDK
-IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-SIM_SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+# Расширение Live Activity обязано иметь те же версии, что и приложение,
+# иначе iOS откажется его устанавливать.
+APP_VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" TgWsProxy/Info.plist)
+plutil -replace CFBundleShortVersionString -string "$APP_VERSION" TgWsProxyLiveActivity/Info.plist
+plutil -replace CFBundleVersion -string "$BUILD_NUMBER" TgWsProxyLiveActivity/Info.plist
 
-# Сборка для реального устройства (arm64)
+IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+
+# Только arm64 для устройства: таргет приложения линкует этот .a напрямую
+# (OTHER_LDFLAGS в project.pbxproj; расширение Live Activity его не получает).
+# Симуляторная сборка и xcframework нигде не использовались.
 SDKROOT=$IOS_SDK CGO_ENABLED=1 GOOS=ios GOARCH=arm64 \
   CC="$(xcrun --sdk iphoneos -f clang)" \
   CGO_CFLAGS="-isysroot $IOS_SDK -arch arm64 -mios-version-min=16.0" \
   CGO_LDFLAGS="-isysroot $IOS_SDK -arch arm64 -mios-version-min=16.0" \
   go build -v -buildmode=c-archive -o $BUILD_DIR/ios/libtgwsproxy.a .
 
-# Сборка для симулятора (arm64)
-SDKROOT=$SIM_SDK CGO_ENABLED=1 GOOS=ios GOARCH=arm64 \
-  CC="$(xcrun --sdk iphonesimulator -f clang)" \
-  CGO_CFLAGS="-isysroot $SIM_SDK -arch arm64 -mios-simulator-version-min=16.0" \
-  CGO_LDFLAGS="-isysroot $SIM_SDK -arch arm64 -mios-simulator-version-min=16.0" \
-  go build -buildmode=c-archive -o $BUILD_DIR/sim/libtgwsproxy.a .
-
-xcodebuild -create-xcframework \
-  -library $BUILD_DIR/ios/libtgwsproxy.a -headers include \
-  -library $BUILD_DIR/sim/libtgwsproxy.a -headers include \
-  -output $BUILD_DIR/$APP_NAME.xcframework
-
 echo ""
 echo "--- Step 2: Building .app ---"
-# Напрямую "скармливаем" линковщику наш бинарник и системную библиотеку resolv
+# EXPERIMENTAL=1 собирает тестовую сборку: в ней видны экспериментальные
+# функции (FakeTLS/nginx, TLS-отпечаток, SNI, фрагментация, DoH). Публичный
+# релиз собирается без них.
+EXTRA_SETTINGS=()
+if [ "${EXPERIMENTAL:-0}" = "1" ]; then
+    echo "Flavor: test (experimental features included)"
+    EXTRA_SETTINGS+=('SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) EXPERIMENTAL')
+else
+    echo "Flavor: public"
+fi
+
 xcodebuild archive \
   -project TgWsProxy.xcodeproj \
   -scheme $APP_NAME \
@@ -72,12 +76,19 @@ xcodebuild archive \
   CODE_SIGNING_REQUIRED=NO \
   CODE_SIGNING_ALLOWED=NO \
   AD_HOC_CODE_SIGNING_ALLOWED=YES \
-  OTHER_LDFLAGS="\$(inherited) \"${PWD}/${BUILD_DIR}/ios/libtgwsproxy.a\" -lresolv"
+  "${EXTRA_SETTINGS[@]}"
 
 echo ""
 echo "--- Step 3: Creating .ipa ---"
 mkdir -p $BUILD_DIR/ipa/Payload
 cp -r $BUILD_DIR/$APP_NAME.xcarchive/Products/Applications/$APP_NAME.app $BUILD_DIR/ipa/Payload/
+
+APPEX="$BUILD_DIR/ipa/Payload/$APP_NAME.app/PlugIns/TgWsProxyLiveActivity.appex"
+if [ ! -d "$APPEX" ]; then
+    echo "ERROR: Live Activity extension is missing from the app bundle"
+    exit 1
+fi
+echo "Live Activity extension embedded: $APPEX"
 cd $BUILD_DIR/ipa
 zip -r ../$APP_NAME.ipa Payload/
 cd ../..

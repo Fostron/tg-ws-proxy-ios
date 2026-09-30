@@ -4,6 +4,7 @@ struct SettingsTab: View {
     @EnvironmentObject var proxyManager: ProxyManager
     @EnvironmentObject var settings: SettingsStore
     @State private var showIpSetup = false
+    @State private var showIslandSettings = false
     /// Numeric keypads have no return key, so without an explicit Done button
     /// the keyboard can't be dismissed by tapping anywhere obvious.
     @FocusState private var focusedField: NumericField?
@@ -20,27 +21,38 @@ struct SettingsTab: View {
                         connectionCard
                         poolCard
                         secretCard
+                        routeCard
                         cdnCard
-                        experimentalCard
-
-                        if settings.experimentalFeaturesEnabled {
-                            Group {
-                                workerCard
-                                fakeTlsCard
-                                dohCard
-                            }
-                            .transition(
-                                .asymmetric(
-                                    insertion: .move(edge: .top)
-                                        .combined(with: .opacity)
-                                        .combined(with: .scale(scale: 0.96, anchor: .top)),
-                                    removal: .opacity
-                                        .combined(with: .scale(scale: 0.96, anchor: .top))
-                                )
-                            )
-                        }
-
+                        workerCard
                         autoStartCard
+
+                        // FakeTLS/nginx, TLS fingerprint, SNI spoofing,
+                        // fragmentation and DoH tuning break more than they
+                        // fix for most people; they only ship in the test
+                        // build (Fostron/test).
+                        if SettingsStore.experimentalBuild {
+                            experimentalCard
+
+                            if settings.experimentalFeaturesEnabled {
+                                Group {
+                                    fakeTlsCard
+                                    nginxCard
+                                    tlsFingerprintCard
+                                    fakeSniCard
+                                    fragmentCard
+                                    dohCard
+                                }
+                                .transition(
+                                    .asymmetric(
+                                        insertion: .move(edge: .top)
+                                            .combined(with: .opacity)
+                                            .combined(with: .scale(scale: 0.96, anchor: .top)),
+                                        removal: .opacity
+                                            .combined(with: .scale(scale: 0.96, anchor: .top))
+                                    )
+                                )
+                            }
+                        }
                     }
                 }
                 .padding(.horizontal)
@@ -49,15 +61,19 @@ struct SettingsTab: View {
                 .animation(.spring(response: 0.42, dampingFraction: 0.82),
                            value: settings.experimentalFeaturesEnabled)
             }
+            .appBackground()
             .navigationTitle(settings.t("settings.title"))
             .toolbar {
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
-                    Button("Готово") { focusedField = nil }
+                    Button(settings.t("ip_sheet.done")) { focusedField = nil }
                 }
             }
             .sheet(isPresented: $showIpSetup) {
                 IpSetupSheet()
+            }
+            .sheet(isPresented: $showIslandSettings) {
+                IslandSettingsView()
             }
         }
     }
@@ -71,6 +87,7 @@ struct SettingsTab: View {
             HStack {
                 Text("IP")
                 Spacer()
+                ipQuickMenu
                 TextField("127.0.0.1", text: $settings.bindIp)
                     .keyboardType(.decimalPad)
                     .textInputAutocapitalization(.never)
@@ -108,18 +125,59 @@ struct SettingsTab: View {
                     }
             }
 
+            // Direct DC addresses apply regardless of the CDN toggle now: CDN
+            // is a fallback tier (or the first one, per the route setting),
+            // not a mode that replaces Direct.
             Button(action: { showIpSetup = true }) {
                 HStack {
                     Image(systemName: "gearshape")
                         .foregroundColor(accent)
-                    Text(settings.cfproxyEnabled ? settings.t("settings.cf_on") : settings.t("settings.configure_dc"))
+                    Text(settings.t("settings.configure_dc"))
                         .fontWeight(.semibold)
                 }
             }
-            .disabled(settings.cfproxyEnabled || proxyManager.isRunning)
+            .disabled(proxyManager.isRunning)
         }
         .padding(18)
         .glassCard()
+    }
+
+    /// One tap between "only this iPhone" and "this iPhone's address in the
+    /// current Wi-Fi / hotspot", instead of typing IPs. The list is read
+    /// fresh every time the menu opens.
+    private var ipQuickMenu: some View {
+        Menu {
+            Button {
+                settings.bindIp = SettingsStore.defaultBindIp
+            } label: {
+                Label("127.0.0.1 — \(settings.t("settings.ip.local"))", systemImage: "iphone")
+            }
+
+            let addresses = NetworkInfo.localIPv4()
+            if addresses.isEmpty {
+                Text(settings.t("settings.ip.no_wifi"))
+            }
+            ForEach(addresses, id: \.self) { address in
+                Button {
+                    settings.bindIp = address.ip
+                } label: {
+                    Label("\(address.ip) — \(settings.t(address.kind == .wifi ? "settings.ip.wifi" : "settings.ip.hotspot"))",
+                          systemImage: address.kind == .wifi ? "wifi" : "personalhotspot")
+                }
+            }
+
+            Button {
+                settings.bindIp = "0.0.0.0"
+            } label: {
+                Label("0.0.0.0 — \(settings.t("settings.ip.all"))", systemImage: "network")
+            }
+        } label: {
+            Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                .font(.title3)
+                .foregroundColor(accent)
+        }
+        .disabled(proxyManager.isRunning)
+        .accessibilityLabel(settings.t("settings.ip.pick"))
     }
 
     private var poolCard: some View {
@@ -159,20 +217,54 @@ struct SettingsTab: View {
         .glassCard()
     }
 
+    private var routeCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            header("arrow.triangle.branch", settings.t("settings.route"))
+
+            Picker("", selection: $settings.routeMode) {
+                Text(settings.t("settings.route.auto")).tag(RouteMode.auto)
+                Text("CDN").tag(RouteMode.cdnFirst)
+                Text("Worker").tag(RouteMode.workerFirst)
+            }
+            .pickerStyle(.segmented)
+            .disabled(proxyManager.isRunning)
+
+            Text(routeHint)
+                .font(.caption)
+                .foregroundColor(routeHintIsWarning ? .orange : .secondary)
+        }
+        .padding(18)
+        .glassCard()
+        .animation(.spring(response: 0.38, dampingFraction: 0.85), value: settings.routeMode)
+    }
+
+    private var routeHintIsWarning: Bool {
+        switch settings.routeMode {
+        case .auto: return false
+        case .cdnFirst: return !settings.cfproxyEnabled
+        case .workerFirst: return !(settings.effectiveCfWorkerEnabled && !settings.cfWorkerURL.isEmpty)
+        }
+    }
+
+    private var routeHint: String {
+        if routeHintIsWarning { return settings.t("settings.route.not_configured") }
+        switch settings.routeMode {
+        case .auto: return settings.t("settings.route.auto_desc")
+        case .cdnFirst: return settings.t("settings.route.cdn_desc")
+        case .workerFirst: return settings.t("settings.route.worker_desc")
+        }
+    }
+
     private var cdnCard: some View {
         VStack(alignment: .leading, spacing: 16) {
             Toggle(isOn: $settings.cfproxyEnabled) {
                 header("cloud", settings.t("settings.cf_cdn"))
             }
             .disabled(proxyManager.isRunning)
-            .onChange(of: settings.cfproxyEnabled) { newValue in
-                settings.isDcAuto = newValue
-            }
 
-            // "Свой домен" is an advanced networking option, so it stays
-            // behind Experimental Features even though the base CDN toggle
-            // above it is always visible.
-            if settings.cfproxyEnabled && settings.experimentalFeaturesEnabled {
+            // Own domain is the most reliable CDN setup (the shared public
+            // list hits Cloudflare's limits), so it's a regular option.
+            if settings.cfproxyEnabled {
                 Toggle(settings.t("settings.custom_domain"), isOn: $settings.customCfDomainEnabled)
                     .disabled(proxyManager.isRunning)
 
@@ -250,7 +342,7 @@ struct SettingsTab: View {
             .disabled(proxyManager.isRunning)
 
             if settings.fakeTlsEnabled {
-                TextField("www.microsoft.com", text: $settings.fakeTlsDomain)
+                TextField("proxy.example.com", text: $settings.fakeTlsDomain)
                     .keyboardType(.URL)
                     .textContentType(.URL)
                     .textInputAutocapitalization(.never)
@@ -262,11 +354,105 @@ struct SettingsTab: View {
                     invalidText: settings.t("settings.faketls_invalid"),
                     validText: settings.t("settings.faketls_valid")
                 )
+
+                TextField(settings.t("settings.faketls_mask_placeholder"), text: $settings.fakeTlsMaskHost)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .disabled(proxyManager.isRunning)
+
+                hint(
+                    valid: settings.isFakeTlsMaskHostValid,
+                    invalidText: settings.t("settings.faketls_mask_invalid"),
+                    validText: settings.t("settings.faketls_mask_hint")
+                )
             }
         }
         .padding(18)
         .glassCard()
         .animation(.spring(response: 0.38, dampingFraction: 0.85), value: settings.fakeTlsEnabled)
+    }
+
+    private var nginxCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Toggle(isOn: $settings.proxyProtocolEnabled) {
+                header("server.rack", settings.t("settings.nginx"))
+            }
+            .disabled(proxyManager.isRunning)
+
+            Text(settings.t("settings.nginx_desc"))
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            HStack {
+                Text(settings.t("settings.link_host"))
+                Spacer()
+                TextField("proxy.example.com", text: $settings.linkHost)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .multilineTextAlignment(.trailing)
+                    .disabled(proxyManager.isRunning)
+            }
+
+            HStack {
+                Text(settings.t("settings.link_port"))
+                Spacer()
+                TextField("443", text: $settings.linkPort)
+                    .keyboardType(.numberPad)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 80)
+                    .disabled(proxyManager.isRunning)
+                    .onChange(of: settings.linkPort) { newValue in
+                        let cleaned = String(newValue.filter { $0.isNumber }.prefix(5))
+                        if cleaned != newValue { settings.linkPort = cleaned }
+                    }
+            }
+
+            hint(
+                valid: settings.isLinkHostValid && settings.isLinkPortValid,
+                invalidText: settings.t("settings.link_invalid"),
+                validText: settings.t("settings.link_hint")
+            )
+
+            if settings.proxyProtocolEnabled && !settings.bindIpIsExposed {
+                Text(settings.t("settings.nginx_loopback_warning"))
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            }
+        }
+        .padding(18)
+        .glassCard()
+    }
+
+    private var fakeSniCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Toggle(isOn: $settings.fakeSniEnabled) {
+                header("eye.slash", "Подмена SNI")
+            }
+            .disabled(proxyManager.isRunning)
+
+            if settings.fakeSniEnabled {
+                TextField("discord.com", text: $settings.fakeSniValue)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .disabled(proxyManager.isRunning)
+
+                if !settings.isFakeSniValid {
+                    Text("Только домен, без https:// и пути")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                } else {
+                    Text("Приманка обязана сама быть за Cloudflare. Иначе edge оборвёт рукопожатие (tls: handshake failure) и весь CDN-тир ляжет — yandex.ru и microsoft.com не подойдут")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+        .padding(18)
+        .glassCard()
+        .animation(.spring(response: 0.38, dampingFraction: 0.85), value: settings.fakeSniEnabled)
     }
 
     private var tlsFingerprintCard: some View {
@@ -354,9 +540,45 @@ struct SettingsTab: View {
             Toggle(isOn: $settings.autoStartOnBoot) {
                 header("power", settings.t("settings.autostart"))
             }
+
+            Divider()
+
+            Toggle(isOn: $settings.showLiveActivity) {
+                header("arrow.up.arrow.down", settings.t("settings.live_activity"))
+            }
+            .onChange(of: settings.showLiveActivity) { show in
+                // Takes effect immediately; the Settings tab is on screen, so
+                // the app is in the foreground as ActivityKit requires.
+                guard proxyManager.isRunning else { return }
+                if show {
+                    LiveActivityManager.shared.start(route: settings.effectiveRouteLabel,
+                                                     language: settings.language.rawValue,
+                                                     style: settings.resolvedIslandStyle)
+                } else {
+                    LiveActivityManager.shared.end()
+                }
+            }
+
+            Text(settings.t("settings.live_activity_desc"))
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            if settings.showLiveActivity {
+                Button {
+                    showIslandSettings = true
+                } label: {
+                    HStack {
+                        Image(systemName: "slider.horizontal.3")
+                            .foregroundColor(accent)
+                        Text(settings.t("settings.live_activity_customize"))
+                            .fontWeight(.semibold)
+                    }
+                }
+            }
         }
         .padding(18)
         .glassCard()
+        .animation(.spring(response: 0.38, dampingFraction: 0.85), value: settings.showLiveActivity)
     }
 
     // MARK: - Helpers
@@ -414,6 +636,7 @@ struct IpSetupSheet: View {
                     Toggle(settings.t("ip_sheet.experimental_mode"), isOn: $settings.isExperimentalMode)
                 }
             }
+            .appBackground()
             .navigationTitle(settings.t("ip_sheet.title"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

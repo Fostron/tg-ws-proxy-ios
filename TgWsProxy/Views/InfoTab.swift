@@ -6,6 +6,9 @@ struct InfoTab: View {
     @EnvironmentObject var logManager: LogManager
     @State private var showHelp = false
 
+    /// Where "Support development" and bug reports go.
+    static let repoURL = "https://github.com/Fostron/tg-ws-proxy-ios"
+
     private var accent: Color { AppPalette(from: settings.themePalette).accent }
 
     var body: some View {
@@ -23,6 +26,7 @@ struct InfoTab: View {
                 }
                 .padding()
             }
+            .appBackground()
             .navigationTitle(settings.t("info.title"))
             .sheet(isPresented: $showHelp) {
                 HelpSheet()
@@ -78,15 +82,15 @@ struct InfoTab: View {
 
         if #available(iOS 26.0, *) {
             return AnyView(
-                Button(action: {}) { label }
+                Button(action: { openUrl(InfoTab.repoURL) }) { label }
                     .buttonStyle(.glassProminent)
-                    .tint(.teal)
+                    .tint(accent)
             )
         } else {
             return AnyView(
-                Button(action: {}) { label }
+                Button(action: { openUrl(InfoTab.repoURL) }) { label }
                     .buttonStyle(.borderedProminent)
-                    .tint(.teal)
+                    .tint(accent)
             )
         }
     }
@@ -108,7 +112,7 @@ struct InfoTab: View {
                 subtitle: settings.t("info.issues.subtitle"),
                 icon: "ant.fill",
                 accent: accent,
-                action: { openUrl("https://github.com/amurcanov/tg-ws-proxy-android/issues/new") }
+                action: { openUrl(InfoTab.repoURL + "/issues/new") }
             )
 
             ActionTile(
@@ -154,7 +158,11 @@ struct InfoTab: View {
     private func copyReport() {
         var report = "App: TG WS Proxy iOS\n"
         report += "Version: \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")\n"
-        report += "Settings: port=\(settings.port), pool=\(settings.poolSize), cf=\(settings.cfproxyEnabled), experimental=\(settings.experimentalFeaturesEnabled)\n"
+        report += "Settings: port=\(settings.port), pool=\(settings.poolSize), route=\(settings.routeMode), cf=\(settings.cfproxyEnabled), "
+            + "worker=\(settings.effectiveCfWorkerEnabled), ownDomain=\(!settings.effectiveCustomCfDomain.isEmpty), "
+            + "fakeTls=\(settings.effectiveFakeTlsEnabled), nginx=\(settings.effectiveProxyProtocol), "
+            + "dc=\(settings.buildDcIps()), experimental=\(settings.experimentalOn), "
+            + "build=\(SettingsStore.experimentalBuild ? "test" : "public")\n"
         report += "Stats: \(proxyManager.stats.description)\n"
         let errors = logManager.logs.filter { $0.level == .error }.suffix(5)
         if errors.isEmpty {
@@ -283,11 +291,14 @@ private struct LinkRow: View {
 struct HelpSheet: View {
     @EnvironmentObject var settings: SettingsStore
     @Environment(\.dismiss) var dismiss
+    @State private var configCopied = false
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
+                    helpSection(titleKey: "help.section.route.title", textKey: "help.section.route.text")
+                    Divider()
                     helpSection(titleKey: "help.section.cf_cdn.title", textKey: "help.section.cf_cdn.text")
                     Divider()
                     helpSection(titleKey: "help.section.ws_pool.title", textKey: "help.section.ws_pool.text")
@@ -296,24 +307,91 @@ struct HelpSheet: View {
                     Divider()
                     helpSection(titleKey: "help.section.dc.title", textKey: "help.section.dc.text")
                     Divider()
-                    helpSection(titleKey: "help.section.experimental.title", textKey: "help.section.experimental.text")
-                    Divider()
                     helpSection(titleKey: "help.section.worker.title", textKey: "help.section.worker.text")
                     Divider()
-                    helpSection(titleKey: "help.section.faketls.title", textKey: "help.section.faketls.text")
+                    helpSection(titleKey: "help.section.island.title", textKey: "help.section.island.text")
                     Divider()
-                    helpSection(titleKey: "help.section.doh.title", textKey: "help.section.doh.text")
-                    Divider()
+                    // Only the test build has these features at all.
+                    if SettingsStore.experimentalBuild {
+                        helpSection(titleKey: "help.section.experimental.title", textKey: "help.section.experimental.text")
+                        Divider()
+                        helpSection(titleKey: "help.section.faketls.title", textKey: "help.section.faketls.text")
+                        nginxConfigBlock
+                        Divider()
+                        helpSection(titleKey: "help.section.doh.title", textKey: "help.section.doh.text")
+                        Divider()
+                    }
                     helpSection(titleKey: "help.section.slow.title", textKey: "help.section.slow.text")
                 }
                 .padding()
             }
+            .appBackground()
             .navigationTitle(settings.t("info.help.title"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button(settings.t("help.close")) { dismiss() }
                 }
+            }
+        }
+    }
+
+    /// nginx stream config filled in from the current settings where they're
+    /// already set, placeholders otherwise.
+    private var nginxConfig: String {
+        let domain = settings.fakeTlsDomain.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sni = domain.isEmpty ? "proxy.example.com" : domain
+        let bind = settings.effectiveBindIp()
+        let phoneIp = (bind == "0.0.0.0" || bind.hasPrefix("127.")) ? "192.168.1.50" : bind
+        let port = Int(settings.port) ?? 1443
+        return """
+        # nginx.conf, на верхнем уровне (рядом с http {}).
+        # Нужен модуль stream (Debian/Ubuntu: libnginx-mod-stream).
+        stream {
+            map $ssl_preread_server_name $tg_upstream {
+                hostnames;
+                \(sni)  tgwsproxy;
+                default  website;
+            }
+
+            upstream tgwsproxy {
+                server \(phoneIp):\(port);  # IP iPhone и порт из приложения
+            }
+
+            upstream website {
+                # обычный HTTPS-сайт; он должен слушать
+                # с proxy_protocol: listen 8443 ssl proxy_protocol;
+                server 127.0.0.1:8443;
+            }
+
+            server {
+                listen 443;
+                ssl_preread on;
+                proxy_protocol on;
+                proxy_pass $tg_upstream;
+            }
+        }
+        """
+    }
+
+    private var nginxConfigBlock: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(nginxConfig)
+                    .font(.system(.caption2, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(10)
+            }
+            .background(Color.secondary.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+
+            Button {
+                UIPasteboard.general.string = nginxConfig
+                configCopied = true
+            } label: {
+                Label(settings.t(configCopied ? "help.section.nginx.copied" : "help.section.nginx.copy"),
+                      systemImage: configCopied ? "checkmark" : "doc.on.doc")
+                    .font(.caption)
             }
         }
     }

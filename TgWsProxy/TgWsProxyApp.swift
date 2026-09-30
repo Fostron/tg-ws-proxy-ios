@@ -16,6 +16,20 @@ struct TgWsProxyApp: App {
                 .onOpenURL { url in
                     handleURL(url)
                 }
+                .task {
+                    // A Live Activity from a previous run that iOS killed
+                    // would otherwise keep showing its last speeds.
+                    if !proxyManager.isRunning {
+                        LiveActivityManager.shared.endAll()
+                    }
+                    // The toggle used to be stored and never read: iOS cannot
+                    // launch an app on boot, so "start on boot" was
+                    // unachievable. Starting when the app is opened is the
+                    // closest thing that actually works, and is what the
+                    // label now promises.
+                    guard settings.autoStartOnBoot, !proxyManager.isRunning else { return }
+                    startProxyAndRedirect(openTelegram: false)
+                }
         }
     }
 
@@ -27,56 +41,15 @@ struct TgWsProxyApp: App {
         }
     }
     
-    private func startProxyAndRedirect() {
-        guard settings.isCfWorkerURLValid, settings.isCustomCfDomainValid,
-              settings.isFakeTlsDomainValid, settings.isDohCustomURLValid, settings.isBindIpValid else { return }
-
-        let dcIps = settings.buildDcIps()
-        let port = Int(settings.port) ?? 1443
-        let bindIp = settings.effectiveBindIp()
-        // Same gating as the manual start path in ConnectionTab: advanced
-        // networking only applies when Experimental Features is unlocked.
-        let cfDomain = settings.effectiveCustomCfDomain
-        let workerEnabled = settings.effectiveCfWorkerEnabled
-        let workerURL = settings.effectiveCfWorkerURL()
-        let tlsEnabled = settings.effectiveFakeTlsEnabled
-        let tlsDomain = settings.effectiveFakeTlsDomain()
-        let fragOn = settings.effectiveFragmentEnabled
-        let fragSize = settings.fragmentFirstSize
-        let fragDelay = settings.fragmentDelayMs
-        let tlsFp = settings.effectiveTlsFingerprint
-        let dohCf = settings.effectiveDohUseCloudflare
-        let dohGoogle = settings.effectiveDohUseGoogle
-        let dohQuad9 = settings.effectiveDohUseQuad9
-        let dohAdguard = settings.effectiveDohUseAdguard
-        let dohCustom = settings.effectiveDohCustomURL
+    private func startProxyAndRedirect(openTelegram: Bool = true) {
+        guard settings.isLaunchConfigValid else { return }
+        // Same snapshot as the manual start path in ConnectionTab.
+        let config = settings.launchConfig()
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let started = proxyManager.start(
-                bindIp: bindIp,
-                port: port,
-                dcIps: dcIps,
-                poolSize: settings.poolSize,
-                cfEnabled: settings.cfproxyEnabled,
-                cfPriority: true,
-                cfDomain: cfDomain,
-                cfWorkerEnabled: workerEnabled,
-                cfWorkerURL: workerURL,
-                fakeTlsEnabled: tlsEnabled,
-                fakeTlsDomain: tlsDomain,
-                fragmentEnabled: fragOn,
-                fragmentFirstSize: fragSize,
-                fragmentDelayMs: fragDelay,
-                tlsFingerprint: tlsFp,
-                dohUseCloudflare: dohCf,
-                dohUseGoogle: dohGoogle,
-                dohUseQuad9: dohQuad9,
-                dohUseAdguard: dohAdguard,
-                dohCustomURL: dohCustom,
-                secretKey: settings.secretKey
-            )
-            
-            if started {
+            let started = proxyManager.start(config)
+
+            if started && openTelegram {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                     if let url = URL(string: "tg://") {
                         UIApplication.shared.open(url)

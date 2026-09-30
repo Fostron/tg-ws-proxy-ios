@@ -46,33 +46,31 @@ class ProxyManager: ObservableObject {
 
     private init() {}
 
-    func start(bindIp: String = "127.0.0.1", port: Int, dcIps: String, poolSize: Int, cfEnabled: Bool, cfPriority: Bool, cfDomain: String,
-               cfWorkerEnabled: Bool = false, cfWorkerURL: String = "",
-               fakeTlsEnabled: Bool = false, fakeTlsDomain: String = "",
-               fragmentEnabled: Bool = false, fragmentFirstSize: Int = 2, fragmentDelayMs: Int = 10,
-               tlsFingerprint: Int = 0,
-               dohUseCloudflare: Bool = true, dohUseGoogle: Bool = true,
-               dohUseQuad9: Bool = true, dohUseAdguard: Bool = true, dohCustomURL: String = "",
-               secretKey: String) -> Bool {
+    func start(_ config: ProxyLaunchConfig) -> Bool {
         guard !isRunning else { return false }
 
-        SetPoolSize(Int32(poolSize))
+        SetPoolSize(Int32(config.poolSize))
         SetCfProxyCacheDir(cachesDirectory().path)
-        SetCfProxyConfig(cfEnabled ? 1 : 0, cfPriority ? 1 : 0, cfDomain)
-        SetCfWorkerConfig(cfWorkerEnabled ? 1 : 0, cfWorkerURL)
-        SetFakeTls(fakeTlsEnabled ? 1 : 0, fakeTlsDomain)
-        SetFragmentConfig(fragmentEnabled ? 1 : 0, Int32(fragmentFirstSize), Int32(fragmentDelayMs))
-        SetTlsFingerprint(Int32(tlsFingerprint))
+        SetCfProxyConfig(config.cfEnabled ? 1 : 0, config.cfDomain)
+        SetRouteMode(Int32(config.routeMode.rawValue))
+        SetCfWorkerConfig(config.cfWorkerEnabled ? 1 : 0, config.cfWorkerURL)
+        SetFakeTls(config.fakeTlsEnabled ? 1 : 0, config.fakeTlsDomain, config.fakeTlsMaskHost)
+        SetProxyProtocol(config.proxyProtocol ? 1 : 0)
+        SetFragmentConfig(config.fragmentEnabled ? 1 : 0, Int32(config.fragmentFirstSize), Int32(config.fragmentDelayMs))
+        SetTlsFingerprint(Int32(config.tlsFingerprint))
+        SetFakeSni(config.fakeSniEnabled ? 1 : 0, config.fakeSniValue)
         SetDohConfig(
-            dohUseCloudflare ? 1 : 0,
-            dohUseGoogle ? 1 : 0,
-            dohUseQuad9 ? 1 : 0,
-            dohUseAdguard ? 1 : 0,
-            dohCustomURL
+            config.dohUseCloudflare ? 1 : 0,
+            config.dohUseGoogle ? 1 : 0,
+            config.dohUseQuad9 ? 1 : 0,
+            config.dohUseAdguard ? 1 : 0,
+            config.dohCustomURL
         )
 
+        let bindIp = config.bindIp
+        let port = config.port
         LogManager.shared.addLog("Запуск на \(bindIp):\(port)...", level: .info)
-        let result = StartProxy(bindIp, Int32(port), dcIps, secretKey, 1)
+        let result = StartProxy(bindIp, Int32(port), config.dcIps, config.secretKey, 1)
         if result != 0 {
             // Almost always a bind failure: the address must actually exist on
             // one of this device's interfaces. A LAN IP that belonged to the
@@ -91,6 +89,10 @@ class ProxyManager: ObservableObject {
                 self.isRunning = true
                 BackgroundManager.shared.startBackgroundTask()
                 self.startStatsPolling()
+                if config.showLiveActivity {
+                    LiveActivityManager.shared.start(route: config.routeLabel, language: config.language,
+                                                     style: config.islandStyle)
+                }
             }
             return true
         }
@@ -112,16 +114,10 @@ class ProxyManager: ObservableObject {
                 self.isRunning = false
                 self.stats = ProxyStats()
                 BackgroundManager.shared.stopBackgroundTask()
+                LiveActivityManager.shared.end()
             }
         }
         stopStatsPolling()
-    }
-
-    func getSecretWithPrefix() -> String? {
-        guard let ptr = GetSecretWithPrefix() else { return nil }
-        let result = String(cString: ptr)
-        FreeString(ptr)
-        return result
     }
 
     func getStats() -> ProxyStats? {
@@ -146,6 +142,7 @@ class ProxyManager: ObservableObject {
                 if let newStats = self.getStats() {
                     DispatchQueue.main.async {
                         self.stats = newStats
+                        LiveActivityManager.shared.update(stats: newStats)
                     }
                 }
                 let lines = self.getLogs()
@@ -181,8 +178,10 @@ class ProxyManager: ObservableObject {
         s.bad = extractStat(raw, key: "bad=") ?? 0
         s.errors = extractStat(raw, key: "err=") ?? 0
         s.poolHits = extractStat(raw, key: "pool=") ?? 0
-        s.bytesUp = parseHumanBytes(extractString(raw, key: "up=") ?? "0B")
-        s.bytesDown = parseHumanBytes(extractString(raw, key: "down=") ?? "0B")
+        // Exact counters when the core provides them (needed for live speeds);
+        // the rounded "up=1.2MB" strings are the fallback.
+        s.bytesUp = extractStat(raw, key: "upb=") ?? parseHumanBytes(extractString(raw, key: "up=") ?? "0B")
+        s.bytesDown = extractStat(raw, key: "downb=") ?? parseHumanBytes(extractString(raw, key: "down=") ?? "0B")
         return s
     }
 

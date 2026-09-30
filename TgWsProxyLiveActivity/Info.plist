@@ -5,7 +5,7 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>$(DEVELOPMENT_LANGUAGE)</string>
     <key>CFBundleDisplayName</key>
-    <string>TgWsProxy Proxy</string>
+    <string>TG WS Proxy</string>
     <key>CFBundleExecutable</key>
     <string>$(EXECUTABLE_NAME)</string>
     <key>CFBundleIdentifier</key>
@@ -16,16 +16,15 @@
     <string>$(PRODUCT_NAME)</string>
     <key>CFBundlePackageType</key>
     <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+    <!-- Both versions must match the app's; build_ios.sh copies them over. -->
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>1.0.5</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>NSExtension</key>
     <dict>
         <key>NSExtensionPointIdentifier</key>
-        <string>com.apple.networkextension.packet-tunnel</string>
-        <key>NSExtensionPrincipalClass</key>
-        <string>$(PRODUCT_MODULE_NAME).PacketTunnelProvider</string>
+        <string>com.apple.widgetkit-extension</string>
     </dict>
 </dict>
 </plist>

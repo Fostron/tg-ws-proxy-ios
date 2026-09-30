@@ -1,35 +1,155 @@
 name: Build iOS IPA
 
+# The same code lives in two repos:
+#   Fostron/test            — test build (experimental features compiled in).
+#                             Every push is published as a rolling release:
+#                             "latest" for main, "build-<branch>" otherwise.
+#   Fostron/tg-ws-proxy-ios — public build. Pushes only produce an artifact;
+#                             pushing a version tag (e.g. 1.0.5) publishes the
+#                             release, with notes from release-notes/<tag>.md.
+# No pull_request trigger: the branch push already builds the same commit.
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: ["**"]
+    tags: ["*"]
+    paths-ignore: ["**.md", "LICENSE"]
   workflow_dispatch:
 
-jobs:
-  build:
-    runs-on: macos-latest
+permissions:
+  contents: write
 
+# A newer push to the same ref makes the running build pointless — and macOS
+# minutes on a private repo are billed at 10x.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IS_TEST_REPO: ${{ github.repository == 'Fostron/test' }}
+
+jobs:
+  core-tests:
+    name: Go core tests
+    # The cgo preamble only uses os_log on Apple platforms, so the core's
+    # logic tests run on cheap Linux runners before any macOS time is spent.
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          # No go.sum is committed (build_ios.sh resolves it), so there's
+          # nothing for setup-go to key a module cache on.
+          cache: false
+
+      - name: Resolve modules
+        run: go mod tidy
+
+      - name: Test
+        run: go test -race -count=1 -v ./...
+
+      - name: Check Worker script syntax
+        run: node --check tgwsproxy-worker.js
+
+  build:
+    name: Build IPA
+    needs: core-tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Select Xcode
         run: |
           sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-          xcrun --sdk iphoneos --show-sdk-path
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version: stable
+          cache: false
 
-      - name: Run build script
+      - name: Build
+        env:
+          EXPERIMENTAL: ${{ env.IS_TEST_REPO == 'true' && '1' || '0' }}
         run: |
           chmod +x build_ios.sh
           ./build_ios.sh
 
-      - name: Upload IPA Artifact
-        uses: actions/upload-artifact@v4
+      - name: Name the IPA
+        id: ipa
+        run: |
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" TgWsProxy/Info.plist)
+          BUILD=$(/usr/libexec/PlistBuddy -c "Print CFBundleVersion" TgWsProxy/Info.plist)
+          NAME="TgWsProxy-${VERSION}-${BUILD}.ipa"
+          cp build/TgWsProxy.ipa "build/${NAME}"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "build=${BUILD}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: TgWsProxy.ipa
-          path: build/TgWsProxy.ipa
+          name: ${{ steps.ipa.outputs.name }}
+          path: build/${{ steps.ipa.outputs.name }}
+          if-no-files-found: error
+
+      - name: Publish version release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.ipa.outputs.version }}
+          NAME: ${{ steps.ipa.outputs.name }}
+        run: |
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::Tag $TAG doesn't match CFBundleShortVersionString $VERSION"
+            exit 1
+          fi
+          NOTES_FILE="release-notes/${TAG}.md"
+          if [ ! -f "$NOTES_FILE" ]; then
+            echo "::error::Missing $NOTES_FILE"
+            exit 1
+          fi
+          # Re-running the tag's build replaces its release instead of failing.
+          gh release delete "$TAG" --yes || true
+          gh release create "$TAG" \
+            "build/TgWsProxy.ipa" "build/${NAME}" \
+            --verify-tag \
+            --title "Release v${TAG}" \
+            --notes-file "$NOTES_FILE" \
+            --latest
+
+      - name: Publish test build
+        if: github.ref_type == 'branch' && env.IS_TEST_REPO == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+          VERSION: ${{ steps.ipa.outputs.version }}
+          BUILD: ${{ steps.ipa.outputs.build }}
+          NAME: ${{ steps.ipa.outputs.name }}
+        run: |
+          if [ "$BRANCH" = "main" ]; then
+            TAG="latest"
+            FLAGS="--latest"
+          else
+            TAG="build-$(echo "$BRANCH" | tr '/ ' '--')"
+            FLAGS="--prerelease --latest=false"
+          fi
+
+          # One release per branch, replaced on every build, so the download
+          # link for that branch never changes.
+          gh release delete "$TAG" --yes --cleanup-tag || true
+
+          NOTES="Тестовая сборка (с экспериментальными функциями). Ветка \`${BRANCH}\`, коммит ${GITHUB_SHA::7}, сборка ${BUILD}.
+          IPA не подписан — установите через AltStore / SideStore / Sideloadly / TrollStore.
+          ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          # TgWsProxy.ipa is the stable name for direct links; the versioned
+          # copy says which build it is.
+          gh release create "$TAG" \
+            "build/TgWsProxy.ipa" "build/${NAME}" \
+            --target "$GITHUB_SHA" \
+            --title "TG WS Proxy ${VERSION} (${BUILD}) — ${BRANCH}" \
+            --notes "$NOTES" \
+            $FLAGS

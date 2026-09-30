@@ -17,11 +17,7 @@ struct ConnectionTab: View {
         return settings.t("conn.status.disconnected")
     }
 
-    private var modeLabel: String {
-        let base = settings.cfproxyEnabled ? "CF" : "Direct"
-        let workerActive = settings.effectiveCfWorkerEnabled && settings.isCfWorkerURLValid && !settings.cfWorkerURL.isEmpty
-        return workerActive ? "\(base)+W" : base
-    }
+    private var modeLabel: String { settings.effectiveRouteLabel }
 
     private var statusColor: Color {
         if proxyManager.isRunning { return AppColors.connected }
@@ -72,6 +68,7 @@ struct ConnectionTab: View {
                     .padding(.top, 8)
                     .padding(.trailing, 16)
             }
+            .appBackground()
             .navigationTitle("")
             .navigationBarHidden(true)
         }
@@ -79,14 +76,20 @@ struct ConnectionTab: View {
 
     // MARK: - Components
 
+    /// Off: the palette color. On: green with a soft glow.
+    private var powerTint: Color {
+        proxyManager.isRunning ? AppColors.connected : (isStarting ? AppColors.warning : palette.accent)
+    }
+
     private var powerButton: some View {
         let button = Button(action: toggleProxy) {
             Image(systemName: "bolt.fill")
                 .font(.system(size: 56))
-                .foregroundColor(proxyManager.isRunning ? AppColors.connected : .gray.opacity(0.6))
+                .foregroundColor(powerTint)
                 .frame(width: 176, height: 176)
         }
         .scaleEffect(proxyManager.isRunning ? 1.06 : 1.0)
+        .shadow(color: proxyManager.isRunning ? AppColors.connected.opacity(0.45) : .clear, radius: 28)
         .animation(.easeInOut(duration: 0.4), value: proxyManager.isRunning)
 
         if #available(iOS 26.0, *) {
@@ -94,7 +97,7 @@ struct ConnectionTab: View {
                 button
                     .buttonStyle(.plain)
                     .glassEffect(
-                        Glass.regular.tint(statusColor.opacity(0.18)).interactive(),
+                        Glass.regular.tint(powerTint.opacity(0.22)).interactive(),
                         in: Circle()
                     )
             )
@@ -104,8 +107,9 @@ struct ConnectionTab: View {
                     .buttonStyle(.plain)
                     .background(
                         Circle()
-                            .fill(proxyManager.isRunning ? AppColors.connectedContainer : Color.gray.opacity(0.08))
+                            .fill(powerTint.opacity(proxyManager.isRunning ? 0.16 : 0.12))
                     )
+                    .overlay(Circle().strokeBorder(powerTint.opacity(0.35), lineWidth: 1.5))
             )
         }
     }
@@ -212,59 +216,17 @@ struct ConnectionTab: View {
             proxyManager.stop()
             isStarting = false
         } else {
-            guard settings.isCfWorkerURLValid, settings.isCustomCfDomainValid,
-                  settings.isFakeTlsDomainValid, settings.isDohCustomURLValid, settings.isBindIpValid else {
+            guard settings.isLaunchConfigValid else {
                 isStarting = false
                 return
             }
 
             requestBackgroundPermissions()
             isStarting = true
-            let dcIps = settings.buildDcIps()
-            let port = Int(settings.port) ?? 1443
-            let bindIp = settings.effectiveBindIp()
-            // Advanced networking (Worker/FakeTLS/DoH/custom domain) only
-            // takes effect when Experimental Features is unlocked, even if
-            // the individual toggles were left on from before.
-            let cfDomain = settings.effectiveCustomCfDomain
-            let workerEnabled = settings.effectiveCfWorkerEnabled
-            let workerURL = settings.effectiveCfWorkerURL()
-            let tlsEnabled = settings.effectiveFakeTlsEnabled
-            let tlsDomain = settings.effectiveFakeTlsDomain()
-            let fragOn = settings.effectiveFragmentEnabled
-            let fragSize = settings.fragmentFirstSize
-            let fragDelay = settings.fragmentDelayMs
-            let tlsFp = settings.effectiveTlsFingerprint
-            let dohCf = settings.effectiveDohUseCloudflare
-            let dohGoogle = settings.effectiveDohUseGoogle
-            let dohQuad9 = settings.effectiveDohUseQuad9
-            let dohAdguard = settings.effectiveDohUseAdguard
-            let dohCustom = settings.effectiveDohCustomURL
+            let config = settings.launchConfig()
 
             DispatchQueue.global(qos: .userInitiated).async {
-                let started = proxyManager.start(
-                    bindIp: bindIp,
-                    port: port,
-                    dcIps: dcIps,
-                    poolSize: settings.poolSize,
-                    cfEnabled: settings.cfproxyEnabled,
-                    cfPriority: true,
-                    cfDomain: cfDomain,
-                    cfWorkerEnabled: workerEnabled,
-                    cfWorkerURL: workerURL,
-                    fakeTlsEnabled: tlsEnabled,
-                    fakeTlsDomain: tlsDomain,
-                    fragmentEnabled: fragOn,
-                    fragmentFirstSize: fragSize,
-                    fragmentDelayMs: fragDelay,
-                    tlsFingerprint: tlsFp,
-                    dohUseCloudflare: dohCf,
-                    dohUseGoogle: dohGoogle,
-                    dohUseQuad9: dohQuad9,
-                    dohUseAdguard: dohAdguard,
-                    dohCustomURL: dohCustom,
-                    secretKey: settings.secretKey
-                )
+                let started = proxyManager.start(config)
                 DispatchQueue.main.async {
                     isStarting = false
                     _ = started
@@ -350,24 +312,49 @@ private struct ThemePaletteMenu: View {
                 .foregroundColor(.secondary)
                 .padding(.horizontal, 4)
 
-            HStack(spacing: 12) {
+            // Each swatch shows the palette's pair of colors, so it's clear
+            // what the background will look like before tapping it.
+            LazyVGrid(columns: Array(repeating: GridItem(.fixed(34), spacing: 10), count: 5),
+                      alignment: .leading, spacing: 10) {
                 ForEach(AppPalette.allCases) { p in
                     Button {
                         settings.themePalette = p.rawValue
                     } label: {
                         Circle()
-                            .fill(p.accent)
-                            .frame(width: 30, height: 30)
+                            .fill(LinearGradient(colors: [p.accent, p.companion],
+                                                 startPoint: .topLeading, endPoint: .bottomTrailing))
+                            .frame(width: 32, height: 32)
                             .overlay(
                                 Circle()
                                     .strokeBorder(Color.primary, lineWidth: settings.themePalette == p.rawValue ? 3 : 0)
                             )
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(p.displayName(settings.language))
                 }
             }
             .padding(.horizontal, 4)
             .padding(.top, 2)
+
+            Text(AppPalette(from: settings.themePalette).displayName(settings.language))
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 4)
+
+            Divider().padding(.vertical, 4)
+
+            Text(settings.t("backdrop.title"))
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 4)
+
+            Picker("", selection: $settings.themeBackdrop) {
+                ForEach(AppBackdrop.allCases) { b in
+                    Text(settings.t("backdrop.\(b.rawValue)")).tag(b.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 4)
 
             Divider().padding(.vertical, 4)
 
@@ -395,6 +382,6 @@ private struct ThemePaletteMenu: View {
             }
         }
         .padding(16)
-        .frame(width: 210)
+        .frame(width: 260)
     }
 }

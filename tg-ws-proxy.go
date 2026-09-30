@@ -67,9 +67,21 @@ const (
 
 	wsPoolMaxAge = 120.0
 
-	dcFailCooldown = 10.0
+	// Same cooldowns upstream uses: a handshake error (non-302) only shortens
+	// the next Direct attempt, while a timeout or a session that never got a
+	// single byte back takes Direct out of rotation for that DC entirely.
+	dcFailCooldown = 60.0
+	ipFailCooldown = 600.0
 
-	wsFailTimeout = 2.0
+	wsFailTimeout   = 2.0
+	wsDirectTimeout = 5.0
+
+	// A relayed session that carried client data but never got one byte back
+	// is what DPI dropping a "connected" route looks like — and also what a
+	// Worker dialing the wrong address looks like. Either the upstream side
+	// hung up on us, or it sat silent at least this long.
+	deadSessionMinSilence = 8 * time.Second
+	deadRouteCooldown     = 10 * time.Minute
 
 	poolMaintainInterval = 5
 
@@ -87,13 +99,16 @@ const (
 
 	cfproxyCacheFileName    = "cfproxy-domains-cache.txt"
 	cfproxyActiveFileName   = "cfproxy-active-domain.txt"
-	cfproxyRefreshInterval  = 12 * time.Hour
-	cfproxyDialPhaseTimeout = 4 * time.Second
-	// Workers sit behind Cloudflare's edge and the TLS+WS handshake regularly
-	// needs more than the 4s CDN budget — logs showed a median session of
-	// ~3.6s ending in an abort with zero bytes ever sent. Upstream uses 10s
-	// for this tier specifically.
-	cfWorkerDialTimeout     = 10 * time.Second
+	cfproxyRefreshInterval = 12 * time.Hour
+	// Upstream gives both Cloudflare tiers 10s per attempt: the edge TLS+WS
+	// handshake on a mobile link regularly needs more than 3-4s, and cutting
+	// it shorter made every attempt abort before the 101 ever arrived.
+	cfproxyDialTimeout  = 10 * time.Second
+	cfWorkerDialTimeout = 10 * time.Second
+	// Whole-tier budget, so a blocked Cloudflare costs each Telegram
+	// connection at most this long before the next tier gets a turn instead
+	// of walking all ~20 public domains one timeout at a time.
+	cfTierBudget            = 20 * time.Second
 	cfproxyFallbackParallel = 2
 	cfproxy429Cooldown      = 45 * time.Second
 	cfproxy429MaxCooldown   = 5 * time.Minute
@@ -119,7 +134,6 @@ func init() {
 // Cloudflare proxy config
 var (
 	cfproxyEnabled    = true
-	cfproxyPriority   = false // true = try CF/CDN before Direct DC (primary), false = CF only used as fallback
 	cfproxyUserDomain = ""
 	// Domains the user typed in Settings. The fetched list is obfuscated
 	// (".com" entries Caesar-decode to ".co.uk"), but a user's own domain is
@@ -138,22 +152,168 @@ var (
 )
 
 // Cloudflare Worker config — an independent routing tier from the CF CDN
-// (cfproxy) fleet above. Always attempted as an automatic fallback tier
-// (after CDN, before raw TCP) whenever it's enabled with a valid URL.
+// (cfproxy) fleet above. In the fallback chain it goes first, as upstream
+// does: Worker -> CDN -> raw TCP.
 var (
 	cfWorkerEnabled = false
 	cfWorkerURL     = ""
 	// Parsed form of cfWorkerURL: upstream lets several worker domains be
 	// listed comma-separated so one dead worker doesn't kill the tier.
 	cfWorkerURLs []string
-	// true = try Worker BEFORE Direct DC. Needed because a Direct WS
-	// handshake can succeed while DPI silently drops the data that follows —
-	// the core sees "connected" and never falls back, so the session hangs.
-	// Only DCs whose handshake fails outright ever reached the Worker tier.
-	cfWorkerPriority = true
-	cfWorkerMu       sync.RWMutex
-	cfWorkerSem      = make(chan struct{}, cfproxyGlobalParallel)
+	cfWorkerMu   sync.RWMutex
+	cfWorkerSem  = make(chan struct{}, cfproxyGlobalParallel)
 )
+
+// Which route a new connection tries first. Auto is upstream's behaviour:
+// Direct WS for DCs that have an address configured, everything else (and
+// every Direct failure) goes down the fallback chain. The other two modes
+// put one Cloudflare tier in front of Direct.
+const (
+	routeAuto        = 0
+	routeCdnFirst    = 1
+	routeWorkerFirst = 2
+)
+
+var (
+	routeMode   = routeAuto
+	routeModeMu sync.RWMutex
+)
+
+func currentRouteMode() int {
+	routeModeMu.RLock()
+	defer routeModeMu.RUnlock()
+	return routeMode
+}
+
+// Routes a connection can take. Used to key per-DC cooldowns for routes that
+// have just proven dead, so the next connection skips straight past them.
+const (
+	tierDirect = "direct"
+	tierCdn    = "cdn"
+	tierWorker = "worker"
+)
+
+type tierKey struct {
+	tier    string
+	dc      int
+	isMedia bool
+}
+
+var (
+	tierFailMu    sync.Mutex
+	tierFailUntil = make(map[tierKey]time.Time)
+	// Dead sessions in a row since the route last carried data. One silent
+	// session isn't enough to condemn a route: Telegram opens several
+	// connections in parallel and some just idle out, and switching a working
+	// CDN off for 10 minutes over that is worse than the silence itself.
+	tierStrikes = make(map[tierKey]int)
+)
+
+const deadStrikesToDisable = 3
+
+// noteDeadSession counts one silent session against the route and reports
+// whether that was the strike that switched it off.
+func noteDeadSession(tier string, dc int, isMedia bool) (int, bool) {
+	key := tierKey{tier, dc, isMedia}
+	tierFailMu.Lock()
+	defer tierFailMu.Unlock()
+	tierStrikes[key]++
+	strikes := tierStrikes[key]
+	if strikes < deadStrikesToDisable {
+		return strikes, false
+	}
+	delete(tierStrikes, key)
+	tierFailUntil[key] = time.Now().Add(deadRouteCooldown)
+	return strikes, true
+}
+
+func tierCoolingDown(tier string, dc int, isMedia bool) (time.Duration, bool) {
+	tierFailMu.Lock()
+	defer tierFailMu.Unlock()
+	until, ok := tierFailUntil[tierKey{tier, dc, isMedia}]
+	if !ok {
+		return 0, false
+	}
+	remaining := time.Until(until)
+	if remaining <= 0 {
+		delete(tierFailUntil, tierKey{tier, dc, isMedia})
+		return 0, false
+	}
+	return remaining, true
+}
+
+func markTierDead(tier string, dc int, isMedia bool, d time.Duration) {
+	tierFailMu.Lock()
+	tierFailUntil[tierKey{tier, dc, isMedia}] = time.Now().Add(d)
+	tierFailMu.Unlock()
+}
+
+func clearTierDead(tier string, dc int, isMedia bool) {
+	tierFailMu.Lock()
+	delete(tierFailUntil, tierKey{tier, dc, isMedia})
+	delete(tierStrikes, tierKey{tier, dc, isMedia})
+	tierFailMu.Unlock()
+}
+
+func resetTierCooldowns() {
+	tierFailMu.Lock()
+	tierFailUntil = make(map[tierKey]time.Time)
+	tierStrikes = make(map[tierKey]int)
+	tierFailMu.Unlock()
+}
+
+func tierName(tier string) string {
+	switch tier {
+	case tierDirect:
+		return "Direct"
+	case tierCdn:
+		return "CDN"
+	case tierWorker:
+		return "Worker"
+	}
+	return tier
+}
+
+// bridgeResult is how a relayed session ended, so the caller can tell a
+// working route from one that swallowed the client's data without answering.
+type bridgeResult struct {
+	up, down      int64
+	elapsed       time.Duration
+	upstreamEnded bool
+}
+
+func (r bridgeResult) looksDead() bool {
+	return r.up > 0 && r.down == 0 && (r.upstreamEnded || r.elapsed >= deadSessionMinSilence)
+}
+
+// judgeSession updates the route's health from how its session went. A dead
+// session can't be retried in place — the client's bytes are spent — but
+// Telegram reconnects right away, and that next connection now skips this
+// route instead of hanging on it again.
+func judgeSession(tier string, dc int, isMedia bool, r bridgeResult) {
+	mTag := mediaTag(isMedia)
+	if !r.looksDead() {
+		if r.down > 0 {
+			clearTierDead(tier, dc, isMedia)
+		}
+		return
+	}
+	why := "сервер закрыл соединение"
+	if !r.upstreamEnded {
+		why = fmt.Sprintf("тишина %.0fс", r.elapsed.Seconds())
+	}
+	strikes, disabled := noteDeadSession(tier, dc, isMedia)
+	if !disabled {
+		logDebug.Printf(" DC%d%s: %s принял %s и не вернул ни байта (%s) — %d из %d до отключения",
+			dc, mTag, tierName(tier), humanBytes(r.up), why, strikes, deadStrikesToDisable)
+		return
+	}
+	logWarn.Printf(" DC%d%s: %s %d раза подряд не вернул ни байта (последний раз %s, %s) — маршрут отключён на %.0f мин",
+		dc, mTag, tierName(tier), strikes, humanBytes(r.up), why, deadRouteCooldown.Minutes())
+	if tier == tierWorker {
+		logWarn.Printf(" DC%d%s: Worker отвечает, но Telegram за ним молчит — разверните свежий tgwsproxy-worker.js (старый терял все данные на новых Worker'ах) и посмотрите Workers → Logs: up=0B значит, что данные не доходят до Worker", dc, mTag)
+	}
+}
 
 const cfproxyDomainsURL = "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt"
 
@@ -163,11 +323,26 @@ var (
 	proxySecretMu sync.RWMutex
 )
 
-// FakeTLS config (ee-secret)
+// FakeTLS config (ee-secret). Only meaningful when clients reach the proxy
+// across a censored network — i.e. the app runs as a server behind nginx
+// (see SetProxyProtocol). Between Telegram and 127.0.0.1 there's no DPI.
 var (
 	fakeTlsEnabled = false
 	fakeTlsDomain  = ""
-	fakeTlsMu      sync.RWMutex
+	// Where a connection that fails the FakeTLS check is forwarded, so an
+	// active prober sees a real website instead of a dead socket. Empty means
+	// "just close it": masking to fakeTlsDomain itself would loop straight
+	// back through nginx (which routes that SNI here) into this proxy.
+	fakeTlsMaskHost = ""
+	fakeTlsMu       sync.RWMutex
+)
+
+// PROXY protocol v1 (nginx `proxy_protocol on;`). When on, every accepted
+// connection must start with a "PROXY ..." line carrying the real client
+// address; without it all clients would look like the nginx host.
+var (
+	proxyProtocolEnabled = false
+	proxyProtocolMu      sync.RWMutex
 )
 
 // DNS over HTTPS (DoH) Cache and Clients
@@ -201,6 +376,12 @@ func connectOneWS(ctx context.Context, ip string, domains []string) *RawWebSocke
 	return nil
 }
 
+// The DCs' own addresses, which speak raw obfuscated MTProto on :443. Every
+// route that ends in a plain TCP connection to Telegram — the TCP fallback
+// and the Worker, which is just a remote TCP dialer — must use these. The
+// user's DC->IP settings (149.154.167.220 by default) point at the
+// kwsN.web.telegram.org WebSocket gateway instead: a TLS server that drops
+// raw MTProto on the floor.
 var dcDefaultIPs = map[int]string{
 	1:   "149.154.175.50",
 	2:   "149.154.167.51",
@@ -287,7 +468,35 @@ func initLogging(verbose bool) {
 // Cloudflare proxy domain decoding
 // ---------------------------------------------------------------------------
 
-var cfproxyEnc = []string{"virkgj.com", "vmmzovy.com", "mkuosckvso.com", "zaewayzmplad.com", "twdmbzcm.com"}
+// Same built-in list upstream ships (proxy/config.py); the live list is still
+// refreshed from GitHub on top of this.
+var cfproxyEnc = []string{
+	"virkgj.com", "vmmzovy.com", "mkuosckvso.com", "zaewayzmplad.com", "twdmbzcm.com",
+	"awzwsldi.com", "clngqrflngqin.com", "tjacxbqtj.com", "bxaxtxmrw.com", "dmohrsgmohcrwb.com",
+	"vwbmtmoi.com", "khgrre.com", "ulihssf.com", "tmhqsdqmfpmk.com", "xwuwoqbm.com",
+	"orgcnunpj.com", "zhkuldz.com", "zypoljnslxa.com", "efabnxaowuzs.com", "zaftuzsftqdq.com",
+}
+
+// parseCfUserDomains splits the "own domain" setting the way upstream's
+// coerce_domain_list does: comma, semicolon or whitespace separated,
+// lowercased, de-duplicated, order kept.
+func parseCfUserDomains(raw string) []string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+	var list []string
+	seen := map[string]bool{}
+	for _, part := range fields {
+		d := strings.ToLower(strings.TrimSpace(part))
+		d = strings.TrimSuffix(d, ".")
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		list = append(list, d)
+	}
+	return list
+}
 
 func decodeCfDomain(s string) string {
 	if !strings.HasSuffix(s, ".com") {
@@ -622,9 +831,13 @@ func initCfproxyDomains() {
 	cfproxyMu.Lock()
 	defer cfproxyMu.Unlock()
 	if cfproxyUserDomain != "" {
-		cfproxyDomains = []string{cfproxyUserDomain}
-		activeCfDomain = cfproxyUserDomain
-		return
+		// The raw setting may hold several comma-separated domains; using it
+		// verbatim produced a single bogus "a.com, b.com" entry.
+		if list := parseCfUserDomains(cfproxyUserDomain); len(list) > 0 {
+			cfproxyDomains = list
+			activeCfDomain = list[0]
+			return
+		}
 	}
 
 	if len(cached) > 0 {
@@ -728,18 +941,12 @@ var validProtos = map[uint32]bool{
 	0xDDDDDDDD: true,
 }
 
+// Only for the web.telegram.org gateway hostnames (wsDomains): DC203 has no
+// kws203.web.telegram.org and is served under kws2. The Cloudflare tier is
+// different — its kwsN records are the user's own, and the setup guide
+// creates kws203 pointing at DC203 itself.
 var dcOverrides = map[int]int{
 	203: 2,
-}
-
-// Telegram serves DC2/DC4 through a shared "redirect" address. Upstream ships
-// this as the default DC->IP mapping and its docs specifically recommend
-// 4:149.154.167.220 when photos/videos won't load on a non-Premium account.
-// The per-DC addresses in dcDefaultIPs are still correct for raw TCP, but the
-// relayed paths behave better against this one.
-var dcRedirectIPs = map[int]string{
-	2: "149.154.167.220",
-	4: "149.154.167.220",
 }
 
 // ---------------------------------------------------------------------------
@@ -784,10 +991,13 @@ func (s *Stats) Summary() string {
 	ph := s.poolHits.Load()
 	pm := s.poolMisses.Load()
 	return fmt.Sprintf(
-		"total=%d active=%d ws=%d tcp_fb=%d cf=%d cfw=%d bad=%d err=%d pool=%d/%d up=%s down=%s",
+		// upb/downb are exact byte counts: the app derives live speeds from
+		// them, which the rounded up/down strings are far too coarse for.
+		"total=%d active=%d ws=%d tcp_fb=%d cf=%d cfw=%d bad=%d err=%d pool=%d/%d up=%s down=%s upb=%d downb=%d",
 		s.connectionsTotal.Load(), s.connectionsActive.Load(), s.connectionsWs.Load(),
 		s.connectionsTcpFallback.Load(), s.connectionsCfproxy.Load(), s.connectionsCfWorker.Load(), s.connectionsBad.Load(),
 		s.wsErrors.Load(), ph, ph+pm, humanBytes(s.bytesUp.Load()), humanBytes(s.bytesDown.Load()),
+		s.bytesUp.Load(), s.bytesDown.Load(),
 	)
 }
 
@@ -1008,6 +1218,38 @@ var (
 	tlsFingerprint   = tlsFpGo
 	tlsFingerprintMu sync.RWMutex
 )
+
+// Fake SNI: send an innocuous server name in the TLS handshake while keeping
+// the real destination in the HTTP Host header.
+//
+// This works because the two are used by different layers. DPI reads the SNI
+// out of the cleartext ClientHello and blocks on it; Cloudflare's edge routes
+// the request by the Host header, which is inside the encrypted stream and
+// invisible from outside. Certificate mismatch is irrelevant here since the
+// client already runs with InsecureSkipVerify.
+//
+// Serverless by construction — nothing to deploy, it only changes what this
+// client puts on the wire.
+// Fires the "bad decoy" hint once per proxy run rather than once per attempt.
+var warnFakeSniOnce sync.Once
+
+var (
+	fakeSniEnabled = false
+	fakeSniValue   = ""
+	fakeSniMu      sync.RWMutex
+)
+
+// sniFor returns the server name to advertise in the handshake for a given
+// real destination host.
+func sniFor(realHost string) string {
+	fakeSniMu.RLock()
+	on, v := fakeSniEnabled, fakeSniValue
+	fakeSniMu.RUnlock()
+	if on && v != "" {
+		return v
+	}
+	return realHost
+}
 
 func currentFingerprint() int {
 	tlsFingerprintMu.RLock()
@@ -1239,16 +1481,6 @@ func wsConnectTimeout(timeout float64) time.Duration {
 	return time.Duration(timeout * float64(time.Second))
 }
 
-func wsHandshakeTimeout(total time.Duration) time.Duration {
-	if total <= 0 {
-		return 3 * time.Second
-	}
-	if total > 3*time.Second {
-		return 3 * time.Second
-	}
-	return total
-}
-
 func contextRemainingTimeout(ctx context.Context, fallback time.Duration) time.Duration {
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
@@ -1336,22 +1568,49 @@ func wsConnectOnce(ctx context.Context, dialAddr, domain, path string, timeout t
 	// Wrap before the TLS handshake so the ClientHello is what gets split.
 	fragConn := maybeFragment(rawConn)
 
+	if sni := sniFor(domain); sni != domain {
+		logDebug.Printf(" SNI подменён: %s -> %s (Host остаётся %s)", domain, sni, domain)
+	}
+
 	fp := currentFingerprint()
 	var tlsConn tlsHandshakeConn
 	if fp == tlsFpGo {
 		goCfg := tlsConfigPool.Clone()
-		goCfg.ServerName = domain
+		goCfg.ServerName = sniFor(domain)
 		goCfg.InsecureSkipVerify = true
 		tlsConn = tls.Client(fragConn, goCfg)
 	} else {
 		uCfg := &utls.Config{
-			ServerName:         domain,
+			ServerName:         sniFor(domain),
 			InsecureSkipVerify: true,
 			ClientSessionCache: utlsSessionCache,
 		}
-		tlsConn = utls.UClient(fragConn, uCfg, utlsHelloID(fp))
+		uConn := utls.UClient(fragConn, uCfg, utlsHelloID(fp))
+
+		// Force ALPN down to http/1.1.
+		//
+		// Browser ClientHello profiles advertise "h2" first, so Cloudflare
+		// negotiates HTTP/2 — but everything below writes a hand-rolled
+		// HTTP/1.1 request. To an h2 server that's garbage, and the
+		// connection is dropped instantly: this is what made every uTLS
+		// fingerprint fail with a bare EOF while the Go stdlib path (which
+		// sends no ALPN at all, so the server defaults to HTTP/1.1) worked.
+		if err := uConn.BuildHandshakeState(); err == nil {
+			for _, ext := range uConn.Extensions {
+				if alpn, ok := ext.(*utls.ALPNExtension); ok {
+					alpn.AlpnProtocols = []string{"http/1.1"}
+				}
+			}
+			// Re-marshal so the edited extension is what actually goes out.
+			if err := uConn.MarshalClientHello(); err != nil {
+				logDebug.Printf(" uTLS: не удалось пересобрать ClientHello: %v", err)
+			}
+		}
+		tlsConn = uConn
 	}
-	handshakeTimeout := wsHandshakeTimeout(timeout)
+	// The whole attempt budget, not a fixed 3s: on a mobile link the TLS
+	// handshake to a Cloudflare edge alone often takes longer than that.
+	handshakeTimeout := contextRemainingTimeout(ctx, timeout)
 	handshakeCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
 
@@ -1359,6 +1618,18 @@ func wsConnectOnce(ctx context.Context, dialAddr, domain, path string, timeout t
 	if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
 		rawConn.Close()
 		logDebug.Printf(" ws tls fail %s via %s: %s", domain, dialAddr, compactConnError(err))
+
+		// A decoy SNI that isn't itself served by the same edge gets the
+		// handshake rejected before the Host header is ever read, which takes
+		// down every domain at once and looks like a total outage. Say so
+		// explicitly instead of leaving the user staring at 20 identical
+		// failures.
+		if sni := sniFor(domain); sni != domain &&
+			strings.Contains(err.Error(), "handshake failure") {
+			warnFakeSniOnce.Do(func() {
+				logError.Printf(" Подмена SNI (%s) отвергнута — приманка должна сама быть за Cloudflare. Отключите её или укажите CF-домен", sni)
+			})
+		}
 		return nil, err
 	}
 	_ = tlsConn.SetDeadline(time.Time{})
@@ -1440,27 +1711,31 @@ func wsConnectOnce(ctx context.Context, dialAddr, domain, path string, timeout t
 	}
 }
 
-func cfConnectDomain(ctx context.Context, domain, path string, timeout float64) (*RawWebSocket, string, error) {
+// failedBeforeConnect reports whether a dial never got a TCP connection up:
+// a DNS failure, refused or unreachable address. Only then can a different IP
+// from DoH help — a TLS or HTTP failure already reached Cloudflare's anycast
+// edge, and DoH would just hand back the same edge.
+func failedBeforeConnect(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
+}
+
+func cfConnectDomain(ctx context.Context, domain, path string, timeout time.Duration) (*RawWebSocket, string, error) {
 	if path == "" {
 		path = "/apiws"
 	}
 
-	attemptTimeout := wsConnectTimeout(timeout)
-	phaseTimeout := attemptTimeout
-	if phaseTimeout > cfproxyDialPhaseTimeout {
-		phaseTimeout = cfproxyDialPhaseTimeout
-	}
-
-	hostCtx, cancelHost, hostTimeout := newTimedAttemptContext(ctx, phaseTimeout)
+	hostCtx, cancelHost, hostTimeout := newTimedAttemptContext(ctx, timeout)
 	ws, hostErr := wsConnectOnce(hostCtx, domain, domain, path, hostTimeout)
 	cancelHost()
 	if hostErr == nil {
 		return ws, "", nil
 	}
-	if isHTTPStatusError(hostErr, http.StatusTooManyRequests) {
-		return nil, "", hostErr
-	}
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || !failedBeforeConnect(hostErr) {
 		return nil, "", hostErr
 	}
 
@@ -1471,7 +1746,7 @@ func cfConnectDomain(ctx context.Context, domain, path string, timeout float64) 
 	}
 
 	logDebug.Printf(" CF DNS %s -> %s", domain, resolvedIP)
-	ipCtx, cancelIP, ipTimeout := newTimedAttemptContext(ctx, phaseTimeout)
+	ipCtx, cancelIP, ipTimeout := newTimedAttemptContext(ctx, timeout)
 	ws, err := wsConnectOnce(ipCtx, resolvedIP, domain, path, ipTimeout)
 	cancelIP()
 	if err == nil {
@@ -1511,9 +1786,12 @@ func wsConnect(ctx context.Context, ip, domain, path string, timeout float64) (*
 	return nil, err
 }
 
-func connectDirectWS(ctx context.Context, target string, domains []string, timeout float64) (*RawWebSocket, bool, bool) {
+// connectDirectWS returns the socket plus (anyRedirect, allRedirects,
+// timedOut). Like upstream, a timeout stops the walk: every domain goes to the
+// same IP, so the next one would just burn another full timeout.
+func connectDirectWS(ctx context.Context, target string, domains []string, timeout float64) (*RawWebSocket, bool, bool, bool) {
 	if len(domains) == 0 {
-		return nil, false, false
+		return nil, false, false, false
 	}
 
 	wsFailedRedirect := false
@@ -1522,10 +1800,11 @@ func connectDirectWS(ctx context.Context, target string, domains []string, timeo
 	for _, dom := range domains {
 		ws, err := wsConnect(ctx, target, dom, "/apiws", timeout)
 		if err == nil {
-			return ws, wsFailedRedirect, false
+			return ws, wsFailedRedirect, false, false
 		}
 
 		stats.wsErrors.Add(1)
+		logDebug.Printf(" Direct %s via %s: %s", dom, target, compactConnError(err))
 		var wsErr *WsHandshakeError
 		if errors.As(err, &wsErr) {
 			if wsErr.IsRedirect() {
@@ -1533,12 +1812,15 @@ func connectDirectWS(ctx context.Context, target string, domains []string, timeo
 			} else {
 				allRedirects = false
 			}
-		} else {
-			allRedirects = false
+			continue
+		}
+		allRedirects = false
+		if ctx.Err() == nil && compactConnError(err) == "timeout" {
+			return nil, wsFailedRedirect, false, true
 		}
 	}
 
-	return nil, wsFailedRedirect, allRedirects
+	return nil, wsFailedRedirect, allRedirects, false
 }
 
 func (ws *RawWebSocket) writeFrame(frame []byte, timeout time.Duration) error {
@@ -2099,6 +2381,12 @@ func (p *WsPool) refill(ctx context.Context, slot dcSlot, q chan *poolEntry, s *
 			defer wg.Done()
 			if ws := connectOneWS(ctx, targetIP, domains); ws != nil {
 				now := time.Now().Unix()
+				// select picks randomly among ready cases, so a stopped proxy
+				// could still park a socket in the queue without this check.
+				if ctx.Err() != nil {
+					SafeClose(ws.conn)
+					return
+				}
 				select {
 				case q <- &poolEntry{ws: ws, created: now}:
 				case <-ctx.Done():
@@ -2113,8 +2401,10 @@ func (p *WsPool) refill(ctx context.Context, slot dcSlot, q chan *poolEntry, s *
 }
 
 func (p *WsPool) Warmup(ctx context.Context, dcOptMap map[int]string) {
-	for dc, targetIP := range dcOptMap {
-		if targetIP == "" {
+	for dc := range dcOptMap {
+		// Negative keys are media overrides ("-2:IP"); they're picked up by
+		// resolveConfiguredTarget below rather than warmed as a "DC-2".
+		if dc <= 0 {
 			continue
 		}
 		for _, isMedia := range []bool{false, true} {
@@ -2122,6 +2412,10 @@ func (p *WsPool) Warmup(ctx context.Context, dcOptMap map[int]string) {
 			case <-ctx.Done():
 				return
 			default:
+			}
+			targetIP, ok := resolveConfiguredTarget(dc, isMedia)
+			if !ok {
+				continue
 			}
 			domains := wsDomains(dc, isMedia)
 			slot := dcSlot{dc, isMediaInt(isMedia)}
@@ -2173,12 +2467,25 @@ func isHTTPTransport(data []byte) bool {
 		string(data[:4]) == "HEAD" || string(data[:7]) == "OPTIONS"
 }
 
+const (
+	endNone int32 = iota
+	endClient
+	endUpstream
+)
+
 func bridgeWS(ctx context.Context, conn net.Conn, ws *RawWebSocket,
 	label string, dc int, dst string, port int, isMedia bool,
-	splitter *MsgSplitter, cltDec, cltEnc, tgEnc, tgDec cipher.Stream) {
+	splitter *MsgSplitter, cltDec, cltEnc, tgEnc, tgDec cipher.Stream) bridgeResult {
 
 	ctx2, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	start := time.Now()
+	var upBytes, downBytes atomic.Int64
+	// Which side ended the session first — the other side's error is just
+	// the fallout of the cancel.
+	var firstEnd atomic.Int32
+	endedBy := func(side int32) { firstEnd.CompareAndSwap(endNone, side) }
 
 	go func() {
 		<-ctx2.Done()
@@ -2229,6 +2536,7 @@ func bridgeWS(ctx context.Context, conn net.Conn, ws *RawWebSocket,
 			if n > 0 {
 				chunk := buf[:n]
 				stats.bytesUp.Add(int64(n))
+				upBytes.Add(int64(n))
 
 				activityMu.Lock()
 				lastActivity = time.Now()
@@ -2249,10 +2557,12 @@ func bridgeWS(ctx context.Context, conn net.Conn, ws *RawWebSocket,
 					sendErr = ws.Send(chunk)
 				}
 				if sendErr != nil {
+					endedBy(endUpstream)
 					return
 				}
 			}
 			if err != nil {
+				endedBy(endClient)
 				if splitter != nil {
 					tail := splitter.Flush()
 					if len(tail) > 0 {
@@ -2279,10 +2589,12 @@ func bridgeWS(ctx context.Context, conn net.Conn, ws *RawWebSocket,
 			_ = ws.conn.SetReadDeadline(time.Now().Add(bridgeReadTimeout))
 			data, err := ws.Recv()
 			if err != nil || data == nil {
+				endedBy(endUpstream)
 				return
 			}
 			n := len(data)
 			stats.bytesDown.Add(int64(n))
+			downBytes.Add(int64(n))
 
 			activityMu.Lock()
 			lastActivity = time.Now()
@@ -2291,12 +2603,23 @@ func bridgeWS(ctx context.Context, conn net.Conn, ws *RawWebSocket,
 			tgDec.XORKeyStream(data, data)
 			cltEnc.XORKeyStream(data, data)
 			if _, werr := conn.Write(data); werr != nil {
+				endedBy(endClient)
 				return
 			}
 		}
 	}()
 
 	wg.Wait()
+
+	res := bridgeResult{
+		up:            upBytes.Load(),
+		down:          downBytes.Load(),
+		elapsed:       time.Since(start),
+		upstreamEnded: firstEnd.Load() == endUpstream,
+	}
+	logDebug.Printf(" DC%d%s сессия через %s закрыта: ↑%s ↓%s за %.1fс",
+		dc, mediaTag(isMedia), dst, humanBytes(res.up), humanBytes(res.down), res.elapsed.Seconds())
+	return res
 }
 
 func bridgeTCP(ctx context.Context, client, remote net.Conn,
@@ -2381,19 +2704,14 @@ func tryCfproxyBaseDomain(ctx context.Context, dc int, baseDomain string) (*RawW
 	}
 	defer releaseCfproxyAttemptSlot()
 
-	// Same mapping wsDomains() uses for the direct-connect gateway hostname —
-	// special DC ids like 203 (media) are served under their base DC's kwsN
-	// subdomain, not a literal kws203 one. Without this, CDN would build a
-	// hostname nobody serves and fail 100% of the time for these DCs.
-	effectiveDC := dc
-	if override, ok := dcOverrides[dc]; ok {
-		effectiveDC = override
-	}
-	domain := fmt.Sprintf("kws%d.%s", effectiveDC, baseDomain)
+	// kws{dc} literally, as upstream does — including kws203. The kwsN
+	// records belong to the CF domain (the setup guide creates all six), so
+	// the web.telegram.org 203->2 mapping doesn't apply here: it sent DC203
+	// traffic to DC2's server.
+	domain := fmt.Sprintf("kws%d.%s", dc, baseDomain)
 	logDebug.Printf(" CDN: пробуем wss://%s/apiws", domain)
-	logDebug.Printf(" CF try %s", domain)
 
-	ws, resolvedIP, err := cfConnectDomain(ctx, domain, "/apiws", 5)
+	ws, resolvedIP, err := cfConnectDomain(ctx, domain, "/apiws", cfproxyDialTimeout)
 	if err != nil {
 		if ctx.Err() == nil && isHTTPStatusError(err, http.StatusTooManyRequests) {
 			markCfproxy429Cooldown(baseDomain, err)
@@ -2441,21 +2759,25 @@ func cfproxyFallback(ctx context.Context, conn net.Conn, relayInit []byte, label
 	mTag := mediaTag(isMedia)
 	logDebug.Printf(" CF fallback DC%d%s: %d домен(ов)", dc, mTag, len(ordered))
 
+	// Connecting (not the session itself) is capped for the whole tier.
+	tierCtx, cancelTier := context.WithTimeout(ctx, cfTierBudget)
+	defer cancelTier()
+
 	var ws *RawWebSocket
 	var chosenDomain string
 
 	if len(ordered) > 0 && ordered[0] != "" {
-		ws, chosenDomain = tryCfproxyBaseDomain(ctx, dc, ordered[0])
+		ws, chosenDomain = tryCfproxyBaseDomain(tierCtx, dc, ordered[0])
 	}
 
-	if ws == nil && len(ordered) > 1 {
+	if ws == nil && len(ordered) > 1 && tierCtx.Err() == nil {
 		remainingDomains := ordered[1:]
 
 		type wsResult struct {
 			ws     *RawWebSocket
 			domain string
 		}
-		attemptCtx, cancelAttempts := context.WithCancel(ctx)
+		attemptCtx, cancelAttempts := context.WithCancel(tierCtx)
 		defer cancelAttempts()
 
 		ch := make(chan wsResult, len(remainingDomains))
@@ -2509,7 +2831,11 @@ func cfproxyFallback(ctx context.Context, conn net.Conn, relayInit []byte, label
 	}
 
 	if ws == nil {
-		logWarn.Printf(" CF fallback DC%d%s: все CF домены недоступны", dc, mTag)
+		if tierCtx.Err() == context.DeadlineExceeded {
+			logWarn.Printf(" CF fallback DC%d%s: за %.0fс ни один CF домен не ответил", dc, mTag, cfTierBudget.Seconds())
+		} else {
+			logWarn.Printf(" CF fallback DC%d%s: все CF домены недоступны", dc, mTag)
+		}
 		return false
 	}
 
@@ -2533,19 +2859,15 @@ func cfproxyFallback(ctx context.Context, conn net.Conn, relayInit []byte, label
 	logDebug.Printf(" CDN: handshake отправлен (%d Б) для DC%d%s через %s",
 		len(relayInit), dc, mediaTag(isMedia), chosenDomain)
 
-	bridgeWS(ctx, conn, ws, label, dc, chosenDomain, 443, isMedia, splitter, cltDec, cltEnc, tgEnc, tgDec)
+	res := bridgeWS(ctx, conn, ws, label, dc, chosenDomain, 443, isMedia, splitter, cltDec, cltEnc, tgEnc, tgDec)
+	judgeSession(tierCdn, dc, isMedia, res)
 	return true
 }
 
 // workerDialTarget resolves the configured Cloudflare Worker URL into a
-// (host, path) pair suitable for wsConnectOnce/cfConnectDomain. The DC number
-// and media flag are appended to the query string so a single Worker script
-// can multiplex all Telegram DCs behind one URL (no wildcard DNS needed,
-// unlike the kwsN.<domain> convention used by the CF CDN tier above).
-//
-// NOTE: this query-string convention (?dc=N&media=0|1 on /apiws) must match
-// whatever routing your worker.js actually implements — adjust here if your
-// script expects the DC in the path or in a header instead.
+// (host, path) pair suitable for wsConnectOnce/cfConnectDomain, with the
+// query string upstream's Worker expects: /apiws?dst=<DC IP>&dc=<n>.
+// media=0|1 is extra, only used for the fork Worker's logging.
 func workerDialTarget(rawURL string, dc int, isMedia bool) (host, path string, ok bool) {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
@@ -2567,18 +2889,13 @@ func workerDialTarget(rawURL string, dc int, isMedia bool) (host, path string, o
 		p = "/apiws"
 	}
 
-	// Resolve the DC to an actual IP here rather than making the Worker keep
-	// its own DC->IP table: this way a user-configured address from
-	// Settings -> DC addresses is honoured, and the Worker stays a dumb relay
-	// that can't drift out of sync with the app.
-	dst := ""
-	if target, ok := resolveConfiguredTarget(dc, isMedia); ok && target != "" {
-		dst = target
-	} else if redirect, ok := dcRedirectIPs[dc]; ok {
-		dst = redirect
-	} else {
-		dst = resolveFallbackTarget(dc, isMedia)
-	}
+	// The Worker opens a plain TCP socket to dst:443 and pipes raw MTProto
+	// into it, so dst must be the DC's own address — exactly what upstream
+	// passes (DC_DEFAULT_IPS). The DC->IP settings / 149.154.167.220 are the
+	// WebSocket gateway, which speaks TLS: sending it raw MTProto got the
+	// session dropped every time, which is why the Worker "never worked"
+	// for DC2/DC4.
+	dst := resolveFallbackTarget(dc, isMedia)
 	if dst == "" {
 		return "", "", false
 	}
@@ -2618,19 +2935,23 @@ func tryCfWorker(ctx context.Context, dc int, isMedia bool) *RawWebSocket {
 	}
 	defer func() { <-cfWorkerSem }()
 
+	tierCtx, cancelTier := context.WithTimeout(ctx, cfTierBudget)
+	defer cancelTier()
+
 	// Try each configured worker in turn: one of them being down or rate
 	// limited shouldn't take the whole tier with it.
 	for _, raw := range urls {
-		if ctx.Err() != nil {
+		if tierCtx.Err() != nil {
 			return nil
 		}
 		host, path, ok := workerDialTarget(raw, dc, isMedia)
 		if !ok {
+			logWarn.Printf(" Worker: не удалось разобрать адрес %q", raw)
 			continue
 		}
 
 		logDebug.Printf(" Worker: пробуем wss://%s%s (таймаут %.0fс)", host, path, cfWorkerDialTimeout.Seconds())
-		ws, resolvedIP, err := cfConnectDomain(ctx, host, path, cfWorkerDialTimeout.Seconds())
+		ws, resolvedIP, err := cfConnectDomain(tierCtx, host, path, cfWorkerDialTimeout)
 		if err != nil {
 			if ctx.Err() == nil {
 				logCfConnError(" Worker fail %s: %s", err, host, compactConnError(err))
@@ -2682,13 +3003,56 @@ func workerFallback(ctx context.Context, conn net.Conn, relayInit []byte, label 
 	//
 	// Upstream does the same (bridge_ws_reencrypt(..., splitter=None) in its
 	// worker fallback), which is what confirmed this.
-	bridgeWS(ctx, conn, ws, label, dc, "cf-worker", 443, isMedia, nil, cltDec, cltEnc, tgEnc, tgDec)
+	res := bridgeWS(ctx, conn, ws, label, dc, "cf-worker", 443, isMedia, nil, cltDec, cltEnc, tgEnc, tgDec)
+	judgeSession(tierWorker, dc, isMedia, res)
 	return true
 }
 
-func doFallback(ctx context.Context, conn net.Conn, relayInit []byte, label string,
+func cfproxyAvailable() bool {
+	cfproxyMu.RLock()
+	defer cfproxyMu.RUnlock()
+	return cfproxyEnabled && len(cfproxyDomains) > 0
+}
+
+func cfWorkerAvailable() bool {
+	cfWorkerMu.RLock()
+	defer cfWorkerMu.RUnlock()
+	return cfWorkerEnabled && len(cfWorkerURLs) > 0
+}
+
+// tryTier runs one Cloudflare tier. It returns true once the client has been
+// bridged (whatever happened during the session), false if the tier couldn't
+// connect at all — the client's bytes are untouched then, so the caller can
+// move on to the next tier.
+func tryTier(tier string, ctx context.Context, conn net.Conn, relayInit []byte, label string,
 	dc int, isMedia bool, splitter *MsgSplitter,
 	cltDec, cltEnc, tgEnc, tgDec cipher.Stream) bool {
+	switch tier {
+	case tierCdn:
+		return cfproxyFallback(ctx, conn, relayInit, label, dc, isMedia, splitter, cltDec, cltEnc, tgEnc, tgDec)
+	case tierWorker:
+		return workerFallback(ctx, conn, relayInit, label, dc, isMedia, splitter, cltDec, cltEnc, tgEnc, tgDec)
+	}
+	return false
+}
+
+func tierAvailable(tier string) bool {
+	switch tier {
+	case tierCdn:
+		return cfproxyAvailable()
+	case tierWorker:
+		return cfWorkerAvailable()
+	}
+	return false
+}
+
+// doFallback walks upstream's fallback chain: Worker -> CDN -> raw TCP.
+// Tiers in `skip` were already attempted for this connection. A tier whose
+// last session came back dead is skipped while its cooldown runs, but still
+// gets a last-chance attempt if everything else fails too.
+func doFallback(ctx context.Context, conn net.Conn, relayInit []byte, label string,
+	dc int, isMedia bool, splitter *MsgSplitter,
+	cltDec, cltEnc, tgEnc, tgDec cipher.Stream, skip map[string]bool) bool {
 
 	if t, ok := cltDec.(interface{ Clone() cipher.Stream }); ok {
 		cltDec = t.Clone()
@@ -2704,24 +3068,23 @@ func doFallback(ctx context.Context, conn net.Conn, relayInit []byte, label stri
 	}
 
 	fallbackDst := resolveFallbackTarget(dc, isMedia)
+	mTag := mediaTag(isMedia)
 
-	cfproxyMu.RLock()
-	useCf := cfproxyEnabled
-	cfproxyMu.RUnlock()
-
-	if useCf {
-		if cfproxyFallback(ctx, conn, relayInit, label, dc, isMedia, splitter, cltDec, cltEnc, tgEnc, tgDec) {
+	var deferred []string
+	for _, tier := range []string{tierWorker, tierCdn} {
+		if skip[tier] || !tierAvailable(tier) {
+			continue
+		}
+		if left, cooling := tierCoolingDown(tier, dc, isMedia); cooling {
+			logDebug.Printf(" DC%d%s: %s пропущен, ещё %.0fс после мёртвой сессии", dc, mTag, tierName(tier), left.Seconds())
+			deferred = append(deferred, tier)
+			continue
+		}
+		if tryTier(tier, ctx, conn, relayInit, label, dc, isMedia, splitter, cltDec, cltEnc, tgEnc, tgDec) {
 			return true
 		}
-	}
-
-	cfWorkerMu.RLock()
-	useWorker := cfWorkerEnabled && cfWorkerURL != ""
-	cfWorkerMu.RUnlock()
-
-	if useWorker {
-		if workerFallback(ctx, conn, relayInit, label, dc, isMedia, splitter, cltDec, cltEnc, tgEnc, tgDec) {
-			return true
+		if ctx.Err() != nil {
+			return false
 		}
 	}
 
@@ -2729,8 +3092,20 @@ func doFallback(ctx context.Context, conn net.Conn, relayInit []byte, label stri
 		if tcpFallback(ctx, conn, fallbackDst, 443, relayInit, label, dc, isMedia, cltDec, cltEnc, tgEnc, tgDec) {
 			return true
 		}
+		logWarn.Printf(" DC%d%s: TCP до %s:443 недоступен", dc, mTag, fallbackDst)
 	}
 
+	for _, tier := range deferred {
+		if ctx.Err() != nil {
+			return false
+		}
+		logInfo.Printf(" DC%d%s: остальные маршруты не сработали — повторяем %s", dc, mTag, tierName(tier))
+		if tryTier(tier, ctx, conn, relayInit, label, dc, isMedia, splitter, cltDec, cltEnc, tgEnc, tgDec) {
+			return true
+		}
+	}
+
+	logWarn.Printf(" DC%d%s: ни один маршрут не доступен", dc, mTag)
 	return false
 }
 
@@ -2928,7 +3303,74 @@ func (f *FakeTlsConn) SetDeadline(t time.Time) error      { return f.conn.SetDea
 func (f *FakeTlsConn) SetReadDeadline(t time.Time) error  { return f.conn.SetReadDeadline(t) }
 func (f *FakeTlsConn) SetWriteDeadline(t time.Time) error { return f.conn.SetWriteDeadline(t) }
 
-// PrefixConn solves the 1/256 disconnect bug gracefully
+var warnNoProxyHeaderOnce sync.Once
+
+// readProxyProtocolV1 consumes a PROXY protocol v1 header ("PROXY TCP4 src
+// dst sport dport\r\n", at most 107 bytes) and returns the real client
+// address. Read byte by byte so nothing past the header is swallowed.
+func readProxyProtocolV1(conn net.Conn) (string, error) {
+	const maxLen = 107
+	line := make([]byte, 0, maxLen)
+	one := make([]byte, 1)
+	for len(line) < maxLen {
+		if _, err := io.ReadFull(conn, one); err != nil {
+			return "", err
+		}
+		line = append(line, one[0])
+		if one[0] == '\n' {
+			break
+		}
+	}
+	text := strings.TrimRight(string(line), "\r\n")
+	if !strings.HasPrefix(text, "PROXY ") {
+		return "", fmt.Errorf("нет заголовка PROXY (%q)", text[:min(len(text), 16)])
+	}
+	parts := strings.Fields(text)
+	if len(parts) >= 6 {
+		return net.JoinHostPort(parts[2], parts[4]), nil
+	}
+	// "PROXY UNKNOWN" — valid, just no address to report.
+	return "", nil
+}
+
+// proxyToMaskHost hands a connection that failed the FakeTLS check to a real
+// web server, so a prober sees an ordinary site answer its ClientHello.
+func proxyToMaskHost(ctx context.Context, conn net.Conn, initial []byte, maskHost, label string) {
+	if maskHost == "" {
+		return
+	}
+	addr := maskHost
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		addr = net.JoinHostPort(addr, "443")
+	}
+
+	d := net.Dialer{Timeout: 10 * time.Second}
+	up, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		logDebug.Printf(" [%s] маскировка: %s недоступен: %s", label, addr, compactConnError(err))
+		return
+	}
+	defer up.Close()
+	logDebug.Printf(" [%s] маскировка -> %s", label, addr)
+
+	_ = conn.SetDeadline(time.Time{})
+	if len(initial) > 0 {
+		if _, err := up.Write(initial); err != nil {
+			return
+		}
+	}
+
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(up, conn); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(conn, up); done <- struct{}{} }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}
+
+// PrefixConn replays bytes already read off the socket (the first byte we
+// peeked at) before handing reads back to the connection.
 type PrefixConn struct {
 	net.Conn
 	prefix []byte
@@ -2963,9 +3405,34 @@ func handleClient(ctx context.Context, conn net.Conn) {
 	proxySecretMu.RUnlock()
 	secretBytes, _ := hex.DecodeString(currentSecret)
 
+	// One snapshot per connection: the Swift side can rewrite these at any
+	// moment, and reading them unlocked mid-handshake is a data race.
 	fakeTlsMu.RLock()
-	useFakeTls := fakeTlsEnabled
+	tlsDomain := ""
+	if fakeTlsEnabled {
+		tlsDomain = fakeTlsDomain
+	}
+	maskHost := fakeTlsMaskHost
 	fakeTlsMu.RUnlock()
+
+	proxyProtocolMu.RLock()
+	expectProxyHeader := proxyProtocolEnabled
+	proxyProtocolMu.RUnlock()
+
+	if expectProxyHeader {
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		realPeer, err := readProxyProtocolV1(conn)
+		if err != nil {
+			logDebug.Printf(" [%s] PROXY protocol: %s", label, err)
+			warnNoProxyHeaderOnce.Do(func() {
+				logWarn.Printf(" Включён режим nginx (PROXY protocol), но подключение пришло без заголовка PROXY — проверьте proxy_protocol on; в nginx или выключите режим")
+			})
+			return
+		}
+		if realPeer != "" {
+			label = realPeer
+		}
+	}
 
 	firstByte := make([]byte, 1)
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -2977,40 +3444,49 @@ func handleClient(ctx context.Context, conn net.Conn) {
 	var clientConn net.Conn = conn
 	var handshake []byte
 
-	if useFakeTls && firstByte[0] == tlsRecordHandshake {
+	if tlsDomain != "" {
+		// FakeTLS on means only ee-clients are legitimate, exactly as upstream
+		// treats it. Anything else is a scanner or active probe, and has to
+		// get what a real web server would give it — not an MTProto socket.
+		if firstByte[0] != tlsRecordHandshake {
+			logDebug.Printf(" [%s] FakeTLS: не TLS (0x%02X) — HTTP-редирект на %s", label, firstByte[0], tlsDomain)
+			_, _ = conn.Write([]byte("HTTP/1.1 301 Moved Permanently\r\nLocation: https://" + tlsDomain +
+				"/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+			return
+		}
+
 		hdrRest := make([]byte, 4)
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		if _, err := io.ReadFull(conn, hdrRest); err != nil {
 			return
 		}
 		tlsHeader := append(firstByte, hdrRest...)
 		recordLen := int(binary.BigEndian.Uint16(tlsHeader[3:5]))
-
 		if recordLen > 16384 {
-			// Not TLS, gracefully fallback
-			clientConn = &PrefixConn{Conn: conn, prefix: tlsHeader}
-		} else {
-			recordBody := make([]byte, recordLen)
-			if _, err := io.ReadFull(conn, recordBody); err != nil {
-				return
-			}
-			clientHello := append(tlsHeader, recordBody...)
-			clientRandom, sessionId, ok := verifyClientHello(clientHello, secretBytes)
-			if !ok {
-				// FakeTLS failed, fallback gracefully (fixes 1/256 disconnect bug)
-				logWarn.Printf(" FakeTLS: ClientHello отвергнут (%d Б) — откат на обычный MTProto", len(clientHello))
-				clientConn = &PrefixConn{Conn: conn, prefix: clientHello}
-			} else {
-				serverHello := buildServerHello(secretBytes, clientRandom, sessionId)
-				if _, err := conn.Write(serverHello); err != nil {
-					return
-				}
-				logDebug.Printf(" FakeTLS: ClientHello принят (%d Б), random=%x sid=%x",
-					len(clientHello), clientRandom[:8], sessionId[:min(8, len(sessionId))])
-				logDebug.Printf(" FakeTLS: ServerHello отправлен (%d Б), маскировка активна под %s",
-					len(serverHello), fakeTlsDomain)
-				clientConn = newFakeTlsConn(conn)
-			}
+			proxyToMaskHost(ctx, conn, tlsHeader, maskHost, label)
+			return
 		}
+
+		recordBody := make([]byte, recordLen)
+		if _, err := io.ReadFull(conn, recordBody); err != nil {
+			return
+		}
+		_ = conn.SetReadDeadline(time.Time{})
+		clientHello := append(tlsHeader, recordBody...)
+		clientRandom, sessionId, ok := verifyClientHello(clientHello, secretBytes)
+		if !ok {
+			// Wrong secret, a stale timestamp (clock >2 min off) or a prober.
+			logDebug.Printf(" [%s] FakeTLS: ClientHello не прошёл проверку (%d Б) — маскировка", label, len(clientHello))
+			proxyToMaskHost(ctx, conn, clientHello, maskHost, label)
+			return
+		}
+
+		serverHello := buildServerHello(secretBytes, clientRandom, sessionId)
+		if _, err := conn.Write(serverHello); err != nil {
+			return
+		}
+		logDebug.Printf(" [%s] FakeTLS: рукопожатие принято (%d Б), SNI %s", label, len(clientHello), tlsDomain)
+		clientConn = newFakeTlsConn(conn)
 	} else {
 		clientConn = &PrefixConn{Conn: conn, prefix: firstByte}
 	}
@@ -3113,38 +3589,32 @@ func handleClient(ctx context.Context, conn net.Conn) {
 	dcKey := [2]int{dc, isMediaInt(isMedia)}
 	now := float64(time.Now().UnixNano()) / 1e9
 
-	splitter, _ := newMsgSplitter(relayInit, proto)
-
-	// Priority mode: "Use Cloudflare CDN" toggle ON means CDN is the primary
-	// route, not just a fallback-after-Direct-fails. Try it first here; on
-	// failure, fall through unchanged into the normal Direct-first path
-	// below (which still ends in doFallback -> CDN/Worker/TCP as before).
-	cfproxyMu.RLock()
-	tryCfFirst := cfproxyEnabled && cfproxyPriority
-	cfproxyMu.RUnlock()
-
-	if tryCfFirst {
-		if cfproxyFallback(ctx, clientConn, relayInit, label, dc, isMedia, splitter, cltDecryptor, cltEncryptor, tgEncryptor, tgDecryptor) {
-			return
-		}
-		splitter, _ = newMsgSplitter(relayInit, proto)
+	newSplitter := func() *MsgSplitter {
+		s, _ := newMsgSplitter(relayInit, proto)
+		return s
+	}
+	fallback := func(skip map[string]bool) bool {
+		return doFallback(ctx, clientConn, relayInit, label, dc, isMedia, newSplitter(), cltDecryptor, cltEncryptor, tgEncryptor, tgDecryptor, skip)
 	}
 
-	// Worker-as-primary. Without this the Worker tier was only ever reached
-	// via doFallback, i.e. after a Direct WS attempt FAILED. But a Direct
-	// handshake to a blocked DC often completes fine and only the payload
-	// afterwards gets dropped by DPI — the core counts that as success and
-	// never falls back, so those DCs hang forever on Direct. In practice only
-	// DC203 (whose handshake fails outright) ever reached the Worker.
-	cfWorkerMu.RLock()
-	tryWorkerFirst := cfWorkerEnabled && cfWorkerURL != "" && cfWorkerPriority
-	cfWorkerMu.RUnlock()
-
-	if tryWorkerFirst {
-		if workerFallback(ctx, clientConn, relayInit, label, dc, isMedia, splitter, cltDecryptor, cltEncryptor, tgEncryptor, tgDecryptor) {
-			return
+	// Optional "X first" modes put one Cloudflare tier ahead of Direct. If it
+	// can't connect, the connection carries on exactly as in Auto, minus the
+	// tier already tried.
+	tried := map[string]bool{}
+	var first string
+	switch currentRouteMode() {
+	case routeCdnFirst:
+		first = tierCdn
+	case routeWorkerFirst:
+		first = tierWorker
+	}
+	if first != "" && tierAvailable(first) {
+		if _, cooling := tierCoolingDown(first, dc, isMedia); !cooling {
+			tried[first] = true
+			if tryTier(first, ctx, clientConn, relayInit, label, dc, isMedia, newSplitter(), cltDecryptor, cltEncryptor, tgEncryptor, tgDecryptor) {
+				return
+			}
 		}
-		splitter, _ = newMsgSplitter(relayInit, proto)
 	}
 
 	target, dcConfigured := resolveConfiguredTarget(dc, isMedia)
@@ -3154,21 +3624,46 @@ func handleClient(ctx context.Context, conn net.Conn) {
 	wsBlackMu.RUnlock()
 
 	if !dcConfigured || blacklisted {
-		doFallback(ctx, clientConn, relayInit, label, dc, isMedia, splitter, cltDecryptor, cltEncryptor, tgEncryptor, tgDecryptor)
+		if !dcConfigured {
+			logDebug.Printf(" DC%d%s: адрес для Direct не задан — резервные маршруты", dc, mTag)
+		}
+		fallback(tried)
 		return
+	}
+
+	// Direct timed out or went silent recently: don't make every new
+	// connection wait for it again, go straight to the fallback chain — and
+	// only come back to Direct if that chain has nothing left.
+	if left, cooling := tierCoolingDown(tierDirect, dc, isMedia); cooling {
+		logDebug.Printf(" DC%d%s: Direct на паузе ещё %.0fс — резервные маршруты", dc, mTag, left.Seconds())
+		if fallback(tried) {
+			return
+		}
+		logInfo.Printf(" DC%d%s: резервы не сработали — пробуем Direct несмотря на паузу", dc, mTag)
 	}
 
 	dcFailMu.RLock()
 	failUntil := dcFailUntil[dcKey]
 	dcFailMu.RUnlock()
 
-	wsTimeout := 10.0
+	wsTimeout := wsDirectTimeout
 	if now < failUntil {
 		wsTimeout = wsFailTimeout
 	}
 
 	domains := wsDomains(dc, isMedia)
-	ws, wsFailedRedirect, allRedirects := connectDirectWS(ctx, target, domains, wsTimeout)
+
+	fromPool := false
+	ws := wsPool.Get(ctx, dc, isMedia, target, domains)
+	if ws != nil {
+		fromPool = true
+		logDebug.Printf(" DC%d%s: соединение из пула", dc, mTag)
+	}
+
+	var wsFailedRedirect, allRedirects, timedOut bool
+	if ws == nil {
+		ws, wsFailedRedirect, allRedirects, timedOut = connectDirectWS(ctx, target, domains, wsTimeout)
+	}
 
 	if ws == nil {
 		logWarn.Printf(" DC%d%s: все попытки WS провалены (DPI/Интернет)", dc, mTag)
@@ -3177,14 +3672,16 @@ func handleClient(ctx context.Context, conn net.Conn) {
 			wsBlacklist[dcKey] = true
 			wsBlackMu.Unlock()
 			logWarn.Printf(" DC%d%s заблокирован (302)", dc, mTag)
+		} else if timedOut {
+			markTierDead(tierDirect, dc, isMedia, ipFailCooldown*time.Second)
+			logWarn.Printf(" DC%d%s: Direct не отвечает — пауза %.0f мин, пока идём резервом", dc, mTag, ipFailCooldown/60)
 		} else {
 			dcFailMu.Lock()
 			dcFailUntil[dcKey] = now + dcFailCooldown
 			dcFailMu.Unlock()
 		}
 
-		splitterFb, _ := newMsgSplitter(relayInit, proto)
-		doFallback(ctx, clientConn, relayInit, label, dc, isMedia, splitterFb, cltDecryptor, cltEncryptor, tgEncryptor, tgDecryptor)
+		fallback(tried)
 		return
 	}
 
@@ -3199,13 +3696,18 @@ func handleClient(ctx context.Context, conn net.Conn) {
 	if err := sendDirectInit(ws); err != nil {
 		logWarn.Printf(" direct relayInit write fail DC%d%s: %s", dc, mTag, compactConnError(err))
 		ws.Close()
+		wasPooled := fromPool
+		fromPool = false
 
-		dcFailMu.Lock()
-		dcFailUntil[dcKey] = now + dcFailCooldown
-		dcFailMu.Unlock()
+		// A pooled socket going stale says nothing about the route.
+		if !wasPooled {
+			dcFailMu.Lock()
+			dcFailUntil[dcKey] = now + dcFailCooldown
+			dcFailMu.Unlock()
+		}
 
 		logWarn.Printf(" direct retry fresh ws DC%d%s", dc, mTag)
-		retryWS, retryFailedRedirect, retryAllRedirects := connectDirectWS(ctx, target, domains, wsTimeout)
+		retryWS, retryFailedRedirect, retryAllRedirects, _ := connectDirectWS(ctx, target, domains, wsTimeout)
 		if retryWS == nil {
 			if retryFailedRedirect && retryAllRedirects {
 				wsBlackMu.Lock()
@@ -3214,8 +3716,7 @@ func handleClient(ctx context.Context, conn net.Conn) {
 				logWarn.Printf(" DC%d%s заблокирован (302)", dc, mTag)
 			}
 			logWarn.Printf(" direct fallback DC%d%s", dc, mTag)
-			splitterFb, _ := newMsgSplitter(relayInit, proto)
-			doFallback(ctx, clientConn, relayInit, label, dc, isMedia, splitterFb, cltDecryptor, cltEncryptor, tgEncryptor, tgDecryptor)
+			fallback(tried)
 			return
 		}
 
@@ -3224,8 +3725,7 @@ func handleClient(ctx context.Context, conn net.Conn) {
 			logWarn.Printf(" direct relayInit write fail DC%d%s: %s", dc, mTag, compactConnError(err))
 			ws.Close()
 			logWarn.Printf(" direct fallback DC%d%s", dc, mTag)
-			splitterFb, _ := newMsgSplitter(relayInit, proto)
-			doFallback(ctx, clientConn, relayInit, label, dc, isMedia, splitterFb, cltDecryptor, cltEncryptor, tgEncryptor, tgDecryptor)
+			fallback(tried)
 			return
 		}
 	}
@@ -3237,7 +3737,14 @@ func handleClient(ctx context.Context, conn net.Conn) {
 	stats.connectionsWs.Add(1)
 	logInfo.Printf(" DC%d%s подключен напрямую", dc, mTag)
 
-	bridgeWS(ctx, clientConn, ws, label, dc, target, 443, isMedia, splitter, cltDecryptor, cltEncryptor, tgEncryptor, tgDecryptor)
+	res := bridgeWS(ctx, clientConn, ws, label, dc, target, 443, isMedia, newSplitter(), cltDecryptor, cltEncryptor, tgEncryptor, tgDecryptor)
+	// A pooled socket the server had already closed dies instantly on first
+	// use; that's a stale pool entry, not DPI eating the route.
+	if fromPool && res.upstreamEnded && res.elapsed < deadSessionMinSilence {
+		logDebug.Printf(" DC%d%s: соединение из пула оказалось закрытым", dc, mTag)
+		return
+	}
+	judgeSession(tierDirect, dc, isMedia, res)
 }
 
 // ---------------------------------------------------------------------------
@@ -3271,42 +3778,66 @@ func runProxy(ctx context.Context, host string, port int, dcOptMap map[int]strin
 	// Configuration summary. Without this the Journal never showed whether
 	// FakeTLS/DoH/Worker were actually engaged, so a misconfigured tier was
 	// indistinguishable from a working one.
+	mode := currentRouteMode()
+	switch mode {
+	case routeCdnFirst:
+		logInfo.Println("  Маршрут: сначала CDN → Direct → Worker → TCP")
+	case routeWorkerFirst:
+		logInfo.Println("  Маршрут: сначала Worker → Direct → CDN → TCP")
+	default:
+		logInfo.Println("  Маршрут: авто (Direct → Worker → CDN → TCP)")
+	}
+
+	var directDCs []string
+	for dc, ip := range dcOptMap {
+		directDCs = append(directDCs, fmt.Sprintf("DC%d:%s", dc, ip))
+	}
+	if len(directDCs) > 0 {
+		logInfo.Printf("  Direct: %s", strings.Join(directDCs, ", "))
+	} else {
+		logInfo.Println("  Direct: адреса DC не заданы — только резервные маршруты")
+	}
+
 	cfproxyMu.RLock()
-	cfOn, cfPrio, cfDom := cfproxyEnabled, cfproxyPriority, cfproxyUserDomain
+	cfOn, cfDom, cfCount := cfproxyEnabled, cfproxyUserDomain, len(cfproxyDomains)
 	cfproxyMu.RUnlock()
 
 	if cfOn {
-		mode := "резерв"
-		if cfPrio {
-			mode = "основной"
-		}
 		if cfDom != "" {
-			logInfo.Printf("  CDN: вкл (%s), свой домен: %s", mode, cfDom)
+			logInfo.Printf("  CDN: вкл, свой домен: %s", cfDom)
 		} else {
-			logInfo.Printf("  CDN: вкл (%s), домены из списка", mode)
+			logInfo.Printf("  CDN: вкл, публичные домены (%d шт.)", cfCount)
 		}
 	} else {
 		logInfo.Println("  CDN: выкл")
 	}
 
 	cfWorkerMu.RLock()
-	wOn, wURL, wPrio := cfWorkerEnabled, cfWorkerURL, cfWorkerPriority
+	wOn, wURL, wCount := cfWorkerEnabled, cfWorkerURL, len(cfWorkerURLs)
 	cfWorkerMu.RUnlock()
 
-	if wOn && wURL != "" {
-		mode := "резерв"
-		if wPrio {
-			mode = "основной"
-		}
-		cfWorkerMu.RLock()
-		n := len(cfWorkerURLs)
-		cfWorkerMu.RUnlock()
-		logInfo.Printf("  Worker: вкл (%s), %d шт. — %s", mode, n, wURL)
+	if wOn && wCount > 0 {
+		logInfo.Printf("  Worker: вкл, %d шт. — %s", wCount, wURL)
 	} else {
 		logInfo.Println("  Worker: выкл")
 	}
+	if mode == routeWorkerFirst && !(wOn && wCount > 0) {
+		logWarn.Println("  Выбран режим «сначала Worker», но Worker не настроен — работает как авто")
+	}
+	if mode == routeCdnFirst && !cfOn {
+		logWarn.Println("  Выбран режим «сначала CDN», но CDN выключен — работает как авто")
+	}
 
 	logInfo.Printf("  TLS-отпечаток: %s", fingerprintName(currentFingerprint()))
+
+	fakeSniMu.RLock()
+	sniOn, sniVal := fakeSniEnabled, fakeSniValue
+	fakeSniMu.RUnlock()
+	if sniOn && sniVal != "" {
+		logInfo.Printf("  Fake SNI: вкл — в рукопожатии видно %s", sniVal)
+	} else {
+		logInfo.Println("  Fake SNI: выкл")
+	}
 
 	fragmentMu.RLock()
 	fragOn, fragSize, fragDelay := fragmentEnabled, fragmentFirstSize, fragmentDelayMs
@@ -3318,15 +3849,26 @@ func runProxy(ctx context.Context, host string, port int, dcOptMap map[int]strin
 	}
 
 	fakeTlsMu.RLock()
-	fOn, fDom := fakeTlsEnabled, fakeTlsDomain
+	fOn, fDom, fMask := fakeTlsEnabled, fakeTlsDomain, fakeTlsMaskHost
 	fakeTlsMu.RUnlock()
 
 	if fOn && fDom != "" {
-		logInfo.Printf("  FakeTLS: вкл, маскировка под %s (секрет ee...)", fDom)
+		if fMask != "" {
+			logInfo.Printf("  FakeTLS: вкл, SNI %s (секрет ee...), чужие подключения -> %s", fDom, fMask)
+		} else {
+			logInfo.Printf("  FakeTLS: вкл, SNI %s (секрет ee...), чужие подключения закрываются", fDom)
+		}
 	} else if fOn {
 		logInfo.Println("  FakeTLS: ВКЛ, но домен не задан — маскировка не активна")
 	} else {
 		logInfo.Println("  FakeTLS: выкл")
+	}
+
+	proxyProtocolMu.RLock()
+	ppOn := proxyProtocolEnabled
+	proxyProtocolMu.RUnlock()
+	if ppOn {
+		logInfo.Println("  nginx: ждём заголовок PROXY protocol v1 на каждом подключении")
 	}
 
 	dohConfigMu.RLock()
@@ -3359,21 +3901,56 @@ func runProxy(ctx context.Context, host string, port int, dcOptMap map[int]strin
 		}
 	}()
 
+	// Pre-open Direct sockets so the first connections don't wait on a TLS
+	// handshake (upstream does the same warmup).
+	wsPool.Warmup(srvCtx, dcOptMap)
+
 	var activeConns sync.WaitGroup
+	var listenerMu sync.Mutex
+	currentListener := listener
 
 	go func() {
+		ln := listener
 		for {
-			conn, err := listener.Accept()
+			conn, err := ln.Accept()
 			if err != nil {
-				select {
-				case <-srvCtx.Done():
-					return
-				default:
-					if ne, ok := err.(net.Error); ok && ne.Timeout() {
-						continue
-					}
+				if srvCtx.Err() != nil {
 					return
 				}
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
+				// iOS can invalidate the listening socket while the app is
+				// suspended. Without this the proxy looked "on" but never
+				// accepted again; upstream restarts its listener the same way.
+				logWarn.Printf(" Слушающий сокет упал (%s) — перезапуск", compactConnError(err))
+				_ = ln.Close()
+				for srvCtx.Err() == nil {
+					select {
+					case <-srvCtx.Done():
+						return
+					case <-time.After(time.Second):
+					}
+					nl, lerr := lc.Listen(srvCtx, "tcp", addr)
+					if lerr != nil {
+						logWarn.Printf(" Не удалось снова занять %s: %s", addr, compactConnError(lerr))
+						continue
+					}
+					listenerMu.Lock()
+					if srvCtx.Err() != nil {
+						// Stopped while we were re-binding: don't leave the
+						// port held for the next StartProxy.
+						listenerMu.Unlock()
+						_ = nl.Close()
+						return
+					}
+					currentListener = nl
+					listenerMu.Unlock()
+					ln = nl
+					logInfo.Printf(" Сокет восстановлен, слушаем %s", addr)
+					break
+				}
+				continue
 			}
 			activeConns.Add(1)
 			go func() {
@@ -3384,7 +3961,9 @@ func runProxy(ctx context.Context, host string, port int, dcOptMap map[int]strin
 	}()
 
 	<-srvCtx.Done()
-	_ = listener.Close()
+	listenerMu.Lock()
+	_ = currentListener.Close()
+	listenerMu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
@@ -3397,7 +3976,8 @@ func runProxy(ctx context.Context, host string, port int, dcOptMap map[int]strin
 	case <-time.After(30 * time.Second):
 	}
 
-	wsPool.CloseAll()
+	// The pool itself is drained by StopProxy: doing it here, up to 30s
+	// later, closed the pool of a proxy that had already been restarted.
 	return nil
 }
 
@@ -3459,6 +4039,8 @@ func StartProxy(cHost *C.char, port C.int, cDcIps *C.char, cSecret *C.char, verb
 
 	initLogging(isVerbose)
 	clearCfproxy429Cooldowns()
+	resetTierCooldowns()
+	warnNoProxyHeaderOnce = sync.Once{}
 
 	if len(secretStr) == 32 {
 		if _, err := hex.DecodeString(secretStr); err == nil {
@@ -3494,19 +4076,22 @@ func StartProxy(cHost *C.char, port C.int, cDcIps *C.char, cSecret *C.char, verb
 
 //export StopProxy
 func StopProxy() C.int {
-	logInfo.Println(" Остановка прокси...")
 	globalMu.Lock()
 	defer globalMu.Unlock()
 
+	// Also guards logInfo: it's nil until the first StartProxy.
 	if globalCancel == nil {
 		return -1
 	}
+	logInfo.Println(" Остановка прокси...")
 
 	globalCancel()
 	globalCancel = nil
 	globalCtx = nil
 
+	wsPool.CloseAll()
 	stats.Reset()
+	resetTierCooldowns()
 
 	wsBlackMu.Lock()
 	wsBlacklist = make(map[[2]int]bool)
@@ -3541,48 +4126,46 @@ func SetCfProxyCacheDir(cCacheDir *C.char) {
 }
 
 //export SetCfProxyConfig
-func SetCfProxyConfig(enabled C.int, priority C.int, cUserDomain *C.char) {
+func SetCfProxyConfig(enabled C.int, cUserDomain *C.char) {
 	cfproxyMu.Lock()
 	defer cfproxyMu.Unlock()
 
 	cfproxyEnabled = int(enabled) != 0
-	cfproxyPriority = int(priority) != 0
 
 	userDomain := strings.TrimSpace(C.GoString(cUserDomain))
 	cfproxyUserDomain = userDomain
 
-	if userDomain != "" {
-		// Several base domains may be listed comma-separated, mirroring how
-		// DC addresses are entered; they're tried in order.
-		// Upstream accepts comma, semicolon or whitespace as separators.
-		fields := strings.FieldsFunc(userDomain, func(r rune) bool {
-			return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
-		})
-		var list []string
-		seen := map[string]bool{}
-		newSet := map[string]bool{}
-		for _, part := range fields {
-			d := strings.ToLower(strings.TrimSpace(part))
-			d = strings.TrimSuffix(d, ".")
-			if d == "" || seen[d] {
-				continue
-			}
-			seen[d] = true
-			newSet[d] = true
-			list = append(list, d)
-		}
-		cfproxyUserDomainMu.Lock()
-		cfproxyUserDomainSet = newSet
-		cfproxyUserDomainMu.Unlock()
-		if len(list) > 0 {
-			cfproxyDomains = list
-			activeCfDomain = list[0]
-		}
-	} else {
-		cfproxyUserDomainMu.Lock()
-		cfproxyUserDomainSet = map[string]bool{}
-		cfproxyUserDomainMu.Unlock()
+	// Several base domains may be listed; they're tried in order.
+	list := parseCfUserDomains(userDomain)
+	newSet := make(map[string]bool, len(list))
+	for _, d := range list {
+		newSet[d] = true
 	}
+	cfproxyUserDomainMu.Lock()
+	cfproxyUserDomainSet = newSet
+	cfproxyUserDomainMu.Unlock()
+	if len(list) > 0 {
+		cfproxyDomains = list
+		activeCfDomain = list[0]
+	}
+}
+
+//export SetRouteMode
+func SetRouteMode(mode C.int) {
+	m := int(mode)
+	if m != routeCdnFirst && m != routeWorkerFirst {
+		m = routeAuto
+	}
+	routeModeMu.Lock()
+	routeMode = m
+	routeModeMu.Unlock()
+}
+
+//export SetProxyProtocol
+func SetProxyProtocol(enabled C.int) {
+	proxyProtocolMu.Lock()
+	proxyProtocolEnabled = int(enabled) != 0
+	proxyProtocolMu.Unlock()
 }
 
 //export SetCfWorkerConfig
@@ -3630,6 +4213,15 @@ func GetLogs() *C.char {
 	return C.CString(strings.Join(lines, "\n"))
 }
 
+//export SetFakeSni
+func SetFakeSni(enabled C.int, cValue *C.char) {
+	fakeSniMu.Lock()
+	defer fakeSniMu.Unlock()
+	warnFakeSniOnce = sync.Once{}
+	fakeSniEnabled = int(enabled) != 0
+	fakeSniValue = strings.TrimSpace(C.GoString(cValue))
+}
+
 //export SetTlsFingerprint
 func SetTlsFingerprint(fp C.int) {
 	tlsFingerprintMu.Lock()
@@ -3654,12 +4246,13 @@ func SetFragmentConfig(enabled C.int, firstSize C.int, delayMs C.int) {
 }
 
 //export SetFakeTls
-func SetFakeTls(enabled C.int, cDomain *C.char) {
+func SetFakeTls(enabled C.int, cDomain *C.char, cMaskHost *C.char) {
 	fakeTlsMu.Lock()
 	defer fakeTlsMu.Unlock()
 
 	fakeTlsEnabled = int(enabled) != 0
-	fakeTlsDomain = C.GoString(cDomain)
+	fakeTlsDomain = strings.TrimSpace(C.GoString(cDomain))
+	fakeTlsMaskHost = strings.TrimSpace(C.GoString(cMaskHost))
 }
 
 //export SetDohConfig

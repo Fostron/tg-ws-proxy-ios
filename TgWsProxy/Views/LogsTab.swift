@@ -78,7 +78,7 @@ struct LogsTab: View {
                 }
             }
         }
-        .background(Color(UIColor.systemGroupedBackground))
+        .appBackground()
     }
 
     private func copyLogs() {
